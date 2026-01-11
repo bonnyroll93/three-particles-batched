@@ -1011,6 +1011,9 @@ export type GeneralData = {
   lifetimeValues: Record<string, Array<number>>;
   noise: Noise;
   isEnabled: boolean;
+
+  // ✅ nuova proprietà per timestamp ultima emissione
+  lastEmissionTime?: number;
 };
 
 export type ParticleSystemInstance = {
