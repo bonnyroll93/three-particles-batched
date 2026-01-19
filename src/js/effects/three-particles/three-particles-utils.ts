@@ -15,10 +15,10 @@ export const calculateRandomPositionAndVelocityOnSphere = (
   velocity: THREE.Vector3,
   speed: number,
   {
-    radius,
-    radiusThickness,
-    arc,
-  }: { radius: number; radiusThickness: number; arc: number }
+    radius = 1,
+    radiusThickness = 1,
+    arc = 360,
+  }: { radius?: number; radiusThickness?: number; arc?: number } = {}
 ) => {
   const u = Math.random() * (arc / 360);
   const v = Math.random();
@@ -59,16 +59,11 @@ export const calculateRandomPositionAndVelocityOnCone = (
   velocity: THREE.Vector3,
   speed: number,
   {
-    radius,
-    radiusThickness,
-    arc,
+    radius = 1,
+    radiusThickness = 1,
+    arc = 360,
     angle = 90,
-  }: {
-    radius: number;
-    radiusThickness: number;
-    arc: number;
-    angle?: number;
-  }
+  }: { radius?: number; radiusThickness?: number; arc?: number; angle?: number } = {}
 ) => {
   const theta = 2 * Math.PI * Math.random() * (arc / 360);
   const randomizedDistanceRatio = Math.random();
@@ -107,7 +102,7 @@ export const calculateRandomPositionAndVelocityOnBox = (
   quaternion: THREE.Quaternion,
   velocity: THREE.Vector3,
   speed: number,
-  { scale, emitFrom }: { scale: Point3D; emitFrom: EmitFrom }
+  { scale = { x: 1, y: 1, z: 1 }, emitFrom = EmitFrom.VOLUME }: { scale?: Point3D; emitFrom?: EmitFrom } = {}
 ) => {
   const _scale = scale as Required<Point3D>;
   switch (emitFrom) {
@@ -135,10 +130,8 @@ export const calculateRandomPositionAndVelocityOnBox = (
       const edge = Math.floor(Math.random() * 4);
       const edgeResult = [];
       edgeResult[perpendicularAxis2] = side2 > 2 ? 1 : 0;
-      edgeResult[(perpendicularAxis2 + 1) % 3] =
-        edge < 2 ? Math.random() : edge - 2;
-      edgeResult[(perpendicularAxis2 + 2) % 3] =
-        edge < 2 ? edge : Math.random();
+      edgeResult[(perpendicularAxis2 + 1) % 3] = edge < 2 ? Math.random() : edge - 2;
+      edgeResult[(perpendicularAxis2 + 2) % 3] = edge < 2 ? edge : Math.random();
       position.x = edgeResult[0] * _scale.x - _scale.x / 2;
       position.y = edgeResult[1] * _scale.y - _scale.y / 2;
       position.z = edgeResult[2] * _scale.z - _scale.z / 2;
@@ -156,11 +149,7 @@ export const calculateRandomPositionAndVelocityOnCircle = (
   quaternion: THREE.Quaternion,
   velocity: THREE.Vector3,
   speed: number,
-  {
-    radius,
-    radiusThickness,
-    arc,
-  }: { radius: number; radiusThickness: number; arc: number }
+  { radius = 1, radiusThickness = 1, arc = 360 }: { radius?: number; radiusThickness?: number; arc?: number } = {}
 ) => {
   const theta = 2 * Math.PI * Math.random() * (arc / 360);
   const randomizedDistanceRatio = Math.random();
@@ -194,7 +183,7 @@ export const calculateRandomPositionAndVelocityOnRectangle = (
   quaternion: THREE.Quaternion,
   velocity: THREE.Vector3,
   speed: number,
-  { rotation, scale }: { rotation: Point3D; scale: Point3D }
+  { rotation = { x: 0, y: 0, z: 0 }, scale = { x: 1, y: 1, z: 1 } }: { rotation?: Point3D; scale?: Point3D } = {}
 ) => {
   const _scale = scale as Required<Point3D>;
   const _rotation = rotation as Required<Point3D>;

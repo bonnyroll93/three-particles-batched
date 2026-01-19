@@ -88,5 +88,13 @@
     "webpack": "^5.97.1",
     "webpack-bundle-analyzer": "^4.10.2",
     "webpack-cli": "^6.0.1"
+  },
+  "overrides": {
+    "three-noise": {
+      "three": "0.180.0"
+    },
+    "@newkrok/three-utils": {
+      "three": "0.180.0"
+    }
   }
 }

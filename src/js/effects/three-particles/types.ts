@@ -458,7 +458,7 @@ export type Noise = {
   rotationAmount: number;
   sizeAmount: number;
   sampler?: FBM;
-  offsets?: Array<number>;
+  offsets?: Array<number> | Float32Array;
 };
 
 export type NoiseConfig = {
@@ -980,7 +980,7 @@ export type NormalizedParticleSystemConfig = Required<ParticleSystemConfig>;
 export type GeneralData = {
   particleSystemId: number;
   normalizedLifetimePercentage: number;
-  creationTimes: Array<number>;
+  creationTimes: Array<number> | Float32Array;
   distanceFromLastEmitByDistance: number;
   lastWorldPosition: THREE.Vector3;
   currentWorldPosition: THREE.Vector3;
