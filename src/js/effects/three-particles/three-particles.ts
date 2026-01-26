@@ -935,7 +935,11 @@ export const updateParticleSystems = ({ now, delta, elapsed }: CycleData) => {
               generalData.wrapperQuaternion.copy(baseQuat ?? new THREE.Quaternion());
             }
           } else {
-            generalData.wrapperQuaternion.copy(baseQuat ?? new THREE.Quaternion());
+            // LOCAL: baseQuat invertito (equivale al “cambio segno” in config)
+            const invBase = baseQuat ? baseQuat.clone().invert() : new THREE.Quaternion();
+
+            generalData.wrapperQuaternion.copy(invBase);
+            generalData.wrapperQuaternion.multiply(worldQuaternion); // oppure _tmpQuat
           }
 
           // shapeOffset + spawnedVelocity (like old calculatePositionAndVelocity into startPositions + velocities)
