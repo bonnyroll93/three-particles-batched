@@ -1,6 +1,5 @@
 import { ObjectUtils } from '@newkrok/three-utils';
 import * as THREE from 'three';
-import { Gyroscope } from 'three/examples/jsm/misc/Gyroscope.js';
 import { FBM } from 'three-noise/build/three-noise.module.js';
 import ParticleSystemFragmentShader from './shaders/particle-system-fragment-shader.glsl.js';
 import ParticleSystemVertexShader from './shaders/particle-system-vertex-shader.glsl.js';
@@ -25,7 +24,7 @@ import {
   createDefaultParticleTexture,
 } from './three-particles-utils.js';
 
-import {
+import type {
   Constant,
   CycleData,
   GeneralData,
@@ -42,7 +41,28 @@ import {
 export * from './types.js';
 
 let _particleSystemId = 0;
-let createdParticleSystems: Array<ParticleSystemInstance> = [];
+let createdParticleSystems: Array<ParticleSystemInstance & any> = [];
+
+// ========== GLOBAL INSTANCED BUFFER (BATCHING) ==========
+let _batchedMaterial: THREE.ShaderMaterial | null = null;
+let _batchedPoints: THREE.Points | null = null;
+
+let MAX_SYSTEMS = 64;
+let _batchedLocked = false;
+
+let _maxTotalParticles = 0;
+let _nextParticleStartIndex = 0;
+let _createdSystemCount = 0;
+
+const _instanceData = new Map<
+  number,
+  {
+    startIndex: number;
+    particleCount: number;
+    generalData: GeneralData;
+    instanceIndex: number;
+  }
+>();
 
 export const blendingMap = {
   'THREE.NoBlending': THREE.NoBlending,
@@ -50,6 +70,15 @@ export const blendingMap = {
   'THREE.AdditiveBlending': THREE.AdditiveBlending,
   'THREE.SubtractiveBlending': THREE.SubtractiveBlending,
   'THREE.MultiplyBlending': THREE.MultiplyBlending,
+} as const;
+
+// ===== FIX TS: safe indexing blendingMap =====
+type BlendingKey = keyof typeof blendingMap;
+const isBlendingKey = (v: unknown): v is BlendingKey => typeof v === 'string' && v in blendingMap;
+const resolveBlending = (v: unknown): THREE.Blending | undefined => {
+  if (typeof v === 'number') return v as THREE.Blending;
+  if (isBlendingKey(v)) return blendingMap[v];
+  return undefined;
 };
 
 export const getDefaultParticleSystemConfig = () =>
@@ -82,30 +111,11 @@ const DEFAULT_PARTICLE_SYSTEM_CONFIG: ParticleSystemConfig = {
   },
   shape: {
     shape: Shape.SPHERE,
-    sphere: {
-      radius: 1.0,
-      radiusThickness: 1.0,
-      arc: 360.0,
-    },
-    cone: {
-      angle: 25.0,
-      radius: 1.0,
-      radiusThickness: 1.0,
-      arc: 360.0,
-    },
-    circle: {
-      radius: 1.0,
-      radiusThickness: 1.0,
-      arc: 360.0,
-    },
-    rectangle: {
-      rotation: { x: 0.0, y: 0.0 }, // TODO: add z rotation
-      scale: { x: 1.0, y: 1.0 },
-    },
-    box: {
-      scale: { x: 1.0, y: 1.0, z: 1.0 },
-      emitFrom: EmitFrom.VOLUME,
-    },
+    sphere: { radius: 1.0, radiusThickness: 1.0, arc: 360.0 },
+    cone: { angle: 25.0, radius: 1.0, radiusThickness: 1.0, arc: 360.0 },
+    circle: { radius: 1.0, radiusThickness: 1.0, arc: 360.0 },
+    rectangle: { rotation: { x: 0.0, y: 0.0 }, scale: { x: 1.0, y: 1.0 } },
+    box: { scale: { x: 1.0, y: 1.0, z: 1.0 }, emitFrom: EmitFrom.VOLUME },
   },
   map: undefined,
   renderer: {
@@ -119,16 +129,8 @@ const DEFAULT_PARTICLE_SYSTEM_CONFIG: ParticleSystemConfig = {
   },
   velocityOverLifetime: {
     isActive: false,
-    linear: {
-      x: 0,
-      y: 0,
-      z: 0,
-    },
-    orbital: {
-      x: 0,
-      y: 0,
-      z: 0,
-    },
+    linear: { x: 0, y: 0, z: 0 },
+    orbital: { x: 0, y: 0, z: 0 },
   },
   sizeOverLifetime: {
     isActive: false,
@@ -141,14 +143,6 @@ const DEFAULT_PARTICLE_SYSTEM_CONFIG: ParticleSystemConfig = {
       ],
     },
   },
-  /* colorOverLifetime: {
-    isActive: false,
-    lifetimeCurve: {
-      type: LifeTimeCurve.EASING,
-      scale: 1,
-      curveFunction: CurveFunctionId.LINEAR,
-    },
-  }, */
   opacityOverLifetime: {
     isActive: false,
     lifetimeCurve: {
@@ -183,29 +177,120 @@ const DEFAULT_PARTICLE_SYSTEM_CONFIG: ParticleSystemConfig = {
   },
 };
 
-const createFloat32Attributes = ({
-  geometry,
-  propertyName,
-  maxParticles,
-  factory,
+export const setBatchedCapacity = ({
+  totalMaxParticles,
+  maxSystems = 64,
 }: {
-  geometry: THREE.BufferGeometry;
-  propertyName: string;
-  maxParticles: number;
-  factory: ((value: never, index: number) => number) | number;
+  totalMaxParticles: number;
+  maxSystems?: number;
 }) => {
-  geometry.setAttribute(
-    propertyName,
-    new THREE.BufferAttribute(
-      new Float32Array(
-        Array.from(
-          { length: maxParticles },
-          typeof factory === 'function' ? factory : () => factory
-        )
-      ),
-      1
-    )
-  );
+  if (_batchedLocked) {
+    throw new Error(
+      'setBatchedCapacity() must be called BEFORE creating any particle system.'
+    );
+  }
+
+  MAX_SYSTEMS = Math.floor(maxSystems);
+  _maxTotalParticles = Math.floor(totalMaxParticles);
+
+  if (MAX_SYSTEMS <= 0) throw new Error('maxSystems must be > 0');
+  if (_maxTotalParticles <= 0) throw new Error('totalMaxParticles must be > 0');
+};
+
+export const getBatchedCapacity = () => ({
+  totalMaxParticles: _maxTotalParticles,
+  maxSystems: MAX_SYSTEMS,
+});
+
+export const getBatchedStats = () => ({
+  capacity: _maxTotalParticles,
+  allocated: _nextParticleStartIndex,
+  systemsCreated: _createdSystemCount,
+  maxSystems: MAX_SYSTEMS,
+});
+
+// ========== BATCHED RENDER OBJECT FACTORY ==========
+let _createBatchedParticleRenderObject = (maxTotalParticles: number): THREE.Points => {
+  const geometry = new THREE.BufferGeometry();
+
+  const mkAttr = (arr: Float32Array, itemSize: number) => {
+    const a = new THREE.BufferAttribute(arr, itemSize);
+    a.setUsage(THREE.DynamicDrawUsage);
+    return a;
+  };
+
+  geometry.setAttribute('emitterIndex', mkAttr(new Float32Array(maxTotalParticles), 1));
+
+  geometry.setAttribute('position', mkAttr(new Float32Array(maxTotalParticles * 3), 3));
+  geometry.setAttribute('isActive', mkAttr(new Float32Array(maxTotalParticles), 1));
+  geometry.setAttribute('lifetime', mkAttr(new Float32Array(maxTotalParticles), 1));
+  geometry.setAttribute('startLifetime', mkAttr(new Float32Array(maxTotalParticles), 1));
+  geometry.setAttribute('size', mkAttr(new Float32Array(maxTotalParticles), 1));
+
+  // legacy (non usato nel shader)
+  geometry.setAttribute('opacity', mkAttr(new Float32Array(maxTotalParticles), 1));
+
+  geometry.setAttribute('rotation', mkAttr(new Float32Array(maxTotalParticles), 1));
+  geometry.setAttribute('colorR', mkAttr(new Float32Array(maxTotalParticles), 1));
+  geometry.setAttribute('colorG', mkAttr(new Float32Array(maxTotalParticles), 1));
+  geometry.setAttribute('colorB', mkAttr(new Float32Array(maxTotalParticles), 1));
+  geometry.setAttribute('colorA', mkAttr(new Float32Array(maxTotalParticles), 1));
+  geometry.setAttribute('startFrame', mkAttr(new Float32Array(maxTotalParticles), 1));
+
+  geometry.setAttribute('instanceMatrix', mkAttr(new Float32Array(16 * MAX_SYSTEMS), 16));
+  geometry.setAttribute('instanceColor', mkAttr(new Float32Array(4 * MAX_SYSTEMS), 4));
+  geometry.setAttribute('instanceStartIndex', mkAttr(new Float32Array(MAX_SYSTEMS), 1));
+  geometry.setAttribute('instanceParticleCount', mkAttr(new Float32Array(MAX_SYSTEMS), 1));
+  geometry.setAttribute('instanceSimulationSpace', mkAttr(new Float32Array(MAX_SYSTEMS), 1));
+
+  const points = new THREE.Points(geometry, _batchedMaterial!);
+  points.frustumCulled = false;
+  points.position.set(0, 0, 0);
+  points.quaternion.identity();
+  points.scale.set(1, 1, 1);
+
+  return points;
+};
+
+const initializeBatchedRenderer = () => {
+  if (_batchedPoints) return;
+
+  if (_maxTotalParticles <= 0) _maxTotalParticles = 2000;
+
+  _batchedMaterial = new THREE.ShaderMaterial({
+    defines: { MAX_SYSTEMS: MAX_SYSTEMS },
+    uniforms: {
+      elapsed: { value: 0.0 },
+      map: { value: createDefaultParticleTexture() },
+      tiles: { value: new THREE.Vector2(1, 1) },
+      fps: { value: 30.0 },
+      useFPSForFrameIndex: { value: false },
+
+      instanceMat0: { value: Array.from({ length: MAX_SYSTEMS }, () => new THREE.Vector4(1, 0, 0, 0)) },
+      instanceMat1: { value: Array.from({ length: MAX_SYSTEMS }, () => new THREE.Vector4(0, 1, 0, 0)) },
+      instanceMat2: { value: Array.from({ length: MAX_SYSTEMS }, () => new THREE.Vector4(0, 0, 1, 0)) },
+      instanceMat3: { value: Array.from({ length: MAX_SYSTEMS }, () => new THREE.Vector4(0, 0, 0, 1)) },
+
+      instanceStartIndex: { value: new Float32Array(MAX_SYSTEMS).fill(0) },
+      instanceParticleCount: { value: new Float32Array(MAX_SYSTEMS).fill(0) },
+      instanceMatrixCount: { value: 0 },
+
+      instanceSimulationSpace: { value: new Float32Array(MAX_SYSTEMS).fill(0) },
+    },
+    vertexShader: ParticleSystemVertexShader,
+    fragmentShader: ParticleSystemFragmentShader,
+    transparent: true,
+
+    // NB: verrà sovrascritto dal primo createParticleSystem() che passa renderer.blending.
+    blending: THREE.AdditiveBlending,
+
+    depthTest: true,
+    depthWrite: false,
+    vertexColors: true,
+  });
+
+  _batchedPoints = _createBatchedParticleRenderObject(_maxTotalParticles);
+  _batchedLocked = true;
 };
 
 const calculatePositionAndVelocity = (
@@ -231,7 +316,6 @@ const calculatePositionAndVelocity = (
         sphere as Required<NonNullable<ShapeConfig['sphere']>>
       );
       break;
-
     case Shape.CONE:
       calculateRandomPositionAndVelocityOnCone(
         position,
@@ -241,7 +325,6 @@ const calculatePositionAndVelocity = (
         cone as Required<NonNullable<ShapeConfig['cone']>>
       );
       break;
-
     case Shape.CIRCLE:
       calculateRandomPositionAndVelocityOnCircle(
         position,
@@ -251,7 +334,6 @@ const calculatePositionAndVelocity = (
         circle as Required<NonNullable<ShapeConfig['circle']>>
       );
       break;
-
     case Shape.RECTANGLE:
       calculateRandomPositionAndVelocityOnRectangle(
         position,
@@ -261,7 +343,6 @@ const calculatePositionAndVelocity = (
         rectangle as Required<NonNullable<ShapeConfig['rectangle']>>
       );
       break;
-
     case Shape.BOX:
       calculateRandomPositionAndVelocityOnBox(
         position,
@@ -274,50 +355,80 @@ const calculatePositionAndVelocity = (
   }
 };
 
-const destroyParticleSystem = (particleSystem: THREE.Points) => {
-  createdParticleSystems = createdParticleSystems.filter(
-    ({
-      particleSystem: savedParticleSystem,
-      wrapper,
-      generalData: { particleSystemId },
-    }) => {
-      if (
-        savedParticleSystem !== particleSystem &&
-        wrapper !== particleSystem
-      ) {
-        return true;
-      }
+const destroyParticleSystem = (particleSystemId: number) => {
+  const meta = _instanceData.get(particleSystemId);
 
+  if (meta && _batchedPoints) {
+    const instCountAttr = _batchedPoints.geometry.getAttribute('instanceParticleCount') as THREE.BufferAttribute;
+    instCountAttr.array[meta.instanceIndex] = 0;
+    instCountAttr.needsUpdate = true;
+
+    if (_batchedMaterial) {
+      (_batchedMaterial.uniforms.instanceParticleCount.value as Float32Array)[meta.instanceIndex] = 0;
+      (_batchedMaterial.uniforms.instanceSimulationSpace.value as Float32Array)[meta.instanceIndex] = 0;
+    }
+  }
+
+  createdParticleSystems = createdParticleSystems.filter(({ generalData }) => {
+    if (generalData.particleSystemId === particleSystemId) {
       removeBezierCurveFunction(particleSystemId);
-      savedParticleSystem.geometry.dispose();
-      if (Array.isArray(savedParticleSystem.material))
-        savedParticleSystem.material.forEach((material) => material.dispose());
-      else savedParticleSystem.material.dispose();
-
-      if (savedParticleSystem.parent)
-        savedParticleSystem.parent.remove(savedParticleSystem);
       return false;
     }
-  );
+    return true;
+  });
+
+  _instanceData.delete(particleSystemId);
+};
+
+// scratch riusati
+const _tmpPos = new THREE.Vector3();
+const _tmpQuat = new THREE.Quaternion();
+const _tmpScale = new THREE.Vector3();
+const _tmpMat = new THREE.Matrix4();
+const _tmpMatInv = new THREE.Matrix4();
+
+// ===== ROTATION FIX SCRATCH =====
+const _baseEuler = new THREE.Euler();
+const _baseQuat = new THREE.Quaternion();
+
+const _readEmitterMatrix = (instanceIndex: number, out: THREE.Matrix4) => {
+  if (!_batchedPoints) return false;
+  const instMatrixAttr = _batchedPoints.geometry.getAttribute('instanceMatrix') as THREE.BufferAttribute;
+  out.fromArray(instMatrixAttr.array as any, instanceIndex * 16);
+  return true;
+};
+
+const _getEmitterTRS = (
+  instanceIndex: number,
+  outPos: THREE.Vector3,
+  outQuat: THREE.Quaternion,
+  outScale: THREE.Vector3
+) => {
+  if (!_readEmitterMatrix(instanceIndex, _tmpMat)) return false;
+  _tmpMat.decompose(outPos, outQuat, outScale);
+  return true;
 };
 
 export const createParticleSystem = (
   config: ParticleSystemConfig = DEFAULT_PARTICLE_SYSTEM_CONFIG,
   externalNow?: number
 ): ParticleSystem => {
-  const now = externalNow || Date.now();
+  const now = externalNow ?? Date.now();
+
   const generalData: GeneralData = {
     particleSystemId: _particleSystemId++,
     normalizedLifetimePercentage: 0,
     distanceFromLastEmitByDistance: 0,
-    lastWorldPosition: new THREE.Vector3(-99999),
-    currentWorldPosition: new THREE.Vector3(-99999),
+
+    lastWorldPosition: new THREE.Vector3(-99999, -99999, -99999),
+    currentWorldPosition: new THREE.Vector3(-99999, -99999, -99999),
     worldPositionChange: new THREE.Vector3(),
     worldQuaternion: new THREE.Quaternion(),
     wrapperQuaternion: new THREE.Quaternion(),
-    lastWorldQuaternion: new THREE.Quaternion(-99999),
+    lastWorldQuaternion: new THREE.Quaternion(-99999, -99999, -99999, -99999) as any,
     worldEuler: new THREE.Euler(),
     gravityVelocity: new THREE.Vector3(0, 0, 0),
+
     startValues: {},
     linearVelocityData: undefined,
     orbitalVelocityData: undefined,
@@ -332,13 +443,18 @@ export const createParticleSystem = (
     },
     isEnabled: true,
   };
+
   const normalizedConfig = ObjectUtils.deepMerge(
     DEFAULT_PARTICLE_SYSTEM_CONFIG as NormalizedParticleSystemConfig,
     config,
     { applyToFirstObject: false, skippedProperties: [] }
   ) as NormalizedParticleSystemConfig;
-  let particleMap: THREE.Texture | null =
-    normalizedConfig.map || createDefaultParticleTexture();
+
+  // Support blending string (FIX TS)
+  {
+    const resolved = resolveBlending((normalizedConfig as any).renderer?.blending);
+    if (resolved !== undefined) (normalizedConfig as any).renderer.blending = resolved;
+  }
 
   const {
     transform,
@@ -348,504 +464,227 @@ export const createParticleSystem = (
     startLifetime,
     startSpeed,
     startSize,
-    startRotation,
     startColor,
-    startOpacity,
     gravity,
     simulationSpace,
     maxParticles,
     emission,
-    shape,
-    renderer,
-    noise,
-    velocityOverLifetime,
     onUpdate,
     onComplete,
+    map,
+    startOpacity,
+    startRotation,
+    noise,
+    velocityOverLifetime,
+    rotationOverLifetime,
     textureSheetAnimation,
-  } = normalizedConfig;
+  } = normalizedConfig as any;
 
-  if (typeof renderer?.blending === 'string')
-    renderer.blending = blendingMap[renderer.blending];
+  const maxP = Math.floor(maxParticles ?? 100);
 
-  const startPositions = Array.from(
-    { length: maxParticles },
-    () => new THREE.Vector3()
-  );
-  const velocities = Array.from(
-    { length: maxParticles },
-    () => new THREE.Vector3()
-  );
+  initializeBatchedRenderer();
 
-  generalData.creationTimes = Array.from({ length: maxParticles }, () => 0);
-
-  if (velocityOverLifetime.isActive) {
-    generalData.linearVelocityData = Array.from(
-      { length: maxParticles },
-      () => ({
-        speed: new THREE.Vector3(
-          velocityOverLifetime.linear.x
-            ? calculateValue(
-                generalData.particleSystemId,
-                velocityOverLifetime.linear.x,
-                0
-              )
-            : 0,
-          velocityOverLifetime.linear.y
-            ? calculateValue(
-                generalData.particleSystemId,
-                velocityOverLifetime.linear.y,
-                0
-              )
-            : 0,
-          velocityOverLifetime.linear.z
-            ? calculateValue(
-                generalData.particleSystemId,
-                velocityOverLifetime.linear.z,
-                0
-              )
-            : 0
-        ),
-        valueModifiers: {
-          x: isLifeTimeCurve(velocityOverLifetime.linear.x || 0)
-            ? getCurveFunctionFromConfig(
-                generalData.particleSystemId,
-                velocityOverLifetime.linear.x as LifetimeCurve
-              )
-            : undefined,
-          y: isLifeTimeCurve(velocityOverLifetime.linear.y || 0)
-            ? getCurveFunctionFromConfig(
-                generalData.particleSystemId,
-                velocityOverLifetime.linear.y as LifetimeCurve
-              )
-            : undefined,
-          z: isLifeTimeCurve(velocityOverLifetime.linear.z || 0)
-            ? getCurveFunctionFromConfig(
-                generalData.particleSystemId,
-                velocityOverLifetime.linear.z as LifetimeCurve
-              )
-            : undefined,
-        },
-      })
-    );
-
-    generalData.orbitalVelocityData = Array.from(
-      { length: maxParticles },
-      () => ({
-        speed: new THREE.Vector3(
-          velocityOverLifetime.orbital.x
-            ? calculateValue(
-                generalData.particleSystemId,
-                velocityOverLifetime.orbital.x,
-                0
-              )
-            : 0,
-          velocityOverLifetime.orbital.y
-            ? calculateValue(
-                generalData.particleSystemId,
-                velocityOverLifetime.orbital.y,
-                0
-              )
-            : 0,
-          velocityOverLifetime.orbital.z
-            ? calculateValue(
-                generalData.particleSystemId,
-                velocityOverLifetime.orbital.z,
-                0
-              )
-            : 0
-        ),
-        valueModifiers: {
-          x: isLifeTimeCurve(velocityOverLifetime.orbital.x || 0)
-            ? getCurveFunctionFromConfig(
-                generalData.particleSystemId,
-                velocityOverLifetime.orbital.x as LifetimeCurve
-              )
-            : undefined,
-          y: isLifeTimeCurve(velocityOverLifetime.orbital.y || 0)
-            ? getCurveFunctionFromConfig(
-                generalData.particleSystemId,
-                velocityOverLifetime.orbital.y as LifetimeCurve
-              )
-            : undefined,
-          z: isLifeTimeCurve(velocityOverLifetime.orbital.z || 0)
-            ? getCurveFunctionFromConfig(
-                generalData.particleSystemId,
-                velocityOverLifetime.orbital.z as LifetimeCurve
-              )
-            : undefined,
-        },
-        positionOffset: new THREE.Vector3(),
-      })
-    );
+  // Apply renderer settings to the (single) batched material.
+  if (_batchedMaterial && (normalizedConfig as any).renderer) {
+    const r = (normalizedConfig as any).renderer;
+    if (r.blending !== undefined) _batchedMaterial.blending = r.blending;
+    if (r.transparent !== undefined) _batchedMaterial.transparent = r.transparent;
+    if (r.depthTest !== undefined) _batchedMaterial.depthTest = r.depthTest;
+    if (r.depthWrite !== undefined) _batchedMaterial.depthWrite = r.depthWrite;
+    _batchedMaterial.needsUpdate = true;
   }
 
-  const startValueKeys: Array<keyof NormalizedParticleSystemConfig> = [
-    'startSize',
-    'startOpacity',
-  ];
-  startValueKeys.forEach((key) => {
-    generalData.startValues[key] = Array.from({ length: maxParticles }, () =>
-      calculateValue(
-        generalData.particleSystemId,
-        normalizedConfig[key] as
-          | Constant
-          | RandomBetweenTwoConstants
-          | LifetimeCurve,
-        0
-      )
+  const requiredTotal = _nextParticleStartIndex + maxP;
+  if (requiredTotal > _maxTotalParticles) {
+    throw new Error(
+      `[three-particles-batched] Batched capacity exceeded: requiredTotal=${requiredTotal} > totalMaxParticles=${_maxTotalParticles}.`
     );
-  });
+  }
+  if (!_batchedPoints || !_batchedMaterial) throw new Error('Batched renderer not initialized');
 
-  const lifetimeValueKeys: Array<keyof NormalizedParticleSystemConfig> = [
-    'rotationOverLifetime',
-  ];
-  lifetimeValueKeys.forEach((key) => {
-    const value = normalizedConfig[key] as {
-      isActive: boolean;
-    } & RandomBetweenTwoConstants;
-    if (value.isActive)
-      generalData.lifetimeValues[key] = Array.from(
-        { length: maxParticles },
-        () => THREE.MathUtils.randFloat(value.min!, value.max!)
-      );
-  });
+  const startIndex = _nextParticleStartIndex;
+  _nextParticleStartIndex += maxP;
 
-  generalData.noise = {
-    isActive: noise.isActive,
-    strength: noise.strength,
-    positionAmount: noise.positionAmount,
-    rotationAmount: noise.rotationAmount,
-    sizeAmount: noise.sizeAmount,
-    sampler: noise.isActive
-      ? new FBM({
-          seed: Math.random(),
-          scale: noise.frequency,
-          octaves: noise.octaves,
-        })
-      : undefined,
-    offsets: noise.useRandomOffset
-      ? Array.from({ length: maxParticles }, () => Math.random() * 100)
-      : undefined,
-  };
+  const instanceIndex = _createdSystemCount++;
+  if (instanceIndex >= MAX_SYSTEMS) throw new Error(`MAX_SYSTEMS exceeded (${MAX_SYSTEMS}).`);
 
-  const material = new THREE.ShaderMaterial({
-    uniforms: {
-      elapsed: {
-        value: 0.0,
-      },
-      map: {
-        value: particleMap,
-      },
-      tiles: {
-        value: textureSheetAnimation.tiles,
-      },
-      fps: {
-        value: textureSheetAnimation.fps,
-      },
-      useFPSForFrameIndex: {
-        value: textureSheetAnimation.timeMode === TimeMode.FPS,
-      },
-      backgroundColor: {
-        value: renderer.backgroundColor,
-      },
-      discardBackgroundColor: {
-        value: renderer.discardBackgroundColor,
-      },
-      backgroundColorTolerance: {
-        value: renderer.backgroundColorTolerance,
-      },
-    },
-    vertexShader: ParticleSystemVertexShader,
-    fragmentShader: ParticleSystemFragmentShader,
-    transparent: renderer.transparent,
-    blending: renderer.blending,
-    depthTest: renderer.depthTest,
-    depthWrite: renderer.depthWrite,
-  });
+  generalData.creationTimes = Array.from({ length: maxP }, () => 0);
 
-  const geometry = new THREE.BufferGeometry();
+  const velocities = Array.from({ length: maxP }, () => new THREE.Vector3());
+  const startPositions = Array.from({ length: maxP }, () => new THREE.Vector3());
 
-  for (let i = 0; i < maxParticles; i++)
-    calculatePositionAndVelocity(
-      generalData,
-      shape,
-      startSpeed,
-      startPositions[i],
-      velocities[i]
-    );
+  // ===== FIX: consider "active" even without isActive (Pixel Fire style) =====
+  const rotOLActive =
+    rotationOverLifetime &&
+    (rotationOverLifetime.isActive === true ||
+      (rotationOverLifetime.min !== undefined && rotationOverLifetime.max !== undefined));
 
-  geometry.setFromPoints(
-    Array.from({ length: maxParticles }, (_, index) =>
-      startPositions[index].clone()
-    )
+  const noiseActive =
+    noise &&
+    (noise.isActive === true ||
+      (noise.strength ?? 0) !== 0 ||
+      (noise.positionAmount ?? 0) !== 0 ||
+      (noise.rotationAmount ?? 0) !== 0 ||
+      (noise.sizeAmount ?? 0) !== 0);
+
+  // startValues
+  (generalData.startValues as any).startSize = Array.from({ length: maxP }, () =>
+    calculateValue(generalData.particleSystemId, startSize, 0)
   );
-
-  const createFloat32AttributesRequest = (
-    propertyName: string,
-    factory: ((value: never, index: number) => number) | number
-  ) => {
-    createFloat32Attributes({
-      geometry,
-      propertyName,
-      maxParticles,
-      factory,
-    });
-  };
-
-  createFloat32AttributesRequest('isActive', 0);
-
-  createFloat32AttributesRequest('lifetime', 0);
-
-  createFloat32AttributesRequest(
-    'startLifetime',
-    () => calculateValue(generalData.particleSystemId, startLifetime, 0) * 1000
-  );
-
-  createFloat32AttributesRequest('startFrame', () =>
-    textureSheetAnimation.startFrame
-      ? calculateValue(
-          generalData.particleSystemId,
-          textureSheetAnimation.startFrame,
-          0
-        )
-      : 0
-  );
-
-  createFloat32AttributesRequest('opacity', () =>
+  (generalData.startValues as any).startOpacity = Array.from({ length: maxP }, () =>
     calculateValue(generalData.particleSystemId, startOpacity, 0)
   );
 
-  createFloat32AttributesRequest('rotation', () =>
-    calculateValue(generalData.particleSystemId, startRotation, 0)
-  );
-
-  createFloat32AttributesRequest(
-    'size',
-    (_, index) => generalData.startValues.startSize[index]
-  );
-
-  createFloat32AttributesRequest('rotation', 0);
-
-  const colorRandomRatio = Math.random();
-  createFloat32AttributesRequest(
-    'colorR',
-    () =>
-      startColor.min!.r! +
-      colorRandomRatio * (startColor.max!.r! - startColor.min!.r!)
-  );
-  createFloat32AttributesRequest(
-    'colorG',
-    () =>
-      startColor.min!.g! +
-      colorRandomRatio * (startColor.max!.g! - startColor.min!.g!)
-  );
-  createFloat32AttributesRequest(
-    'colorB',
-    () =>
-      startColor.min!.b! +
-      colorRandomRatio * (startColor.max!.b! - startColor.min!.b!)
-  );
-  createFloat32AttributesRequest('colorA', 0);
-
-  const deactivateParticle = (particleIndex: number) => {
-    geometry.attributes.isActive.array[particleIndex] = 0;
-    geometry.attributes.colorA.array[particleIndex] = 0;
-    geometry.attributes.colorA.needsUpdate = true;
-  };
-
-  const activateParticle = ({
-    particleIndex,
-    activationTime,
-    position,
-  }: {
-    particleIndex: number;
-    activationTime: number;
-    position: Required<Point3D>;
-  }) => {
-    geometry.attributes.isActive.array[particleIndex] = 1;
-    generalData.creationTimes[particleIndex] = activationTime;
-
-    if (generalData.noise.offsets)
-      generalData.noise.offsets[particleIndex] = Math.random() * 100;
-
-    const colorRandomRatio = Math.random();
-
-    geometry.attributes.colorR.array[particleIndex] =
-      startColor.min!.r! +
-      colorRandomRatio * (startColor.max!.r! - startColor.min!.r!);
-    geometry.attributes.colorR.needsUpdate = true;
-
-    geometry.attributes.colorG.array[particleIndex] =
-      startColor.min!.g! +
-      colorRandomRatio * (startColor.max!.g! - startColor.min!.g!);
-    geometry.attributes.colorG.needsUpdate = true;
-
-    geometry.attributes.colorB.array[particleIndex] =
-      startColor.min!.b! +
-      colorRandomRatio * (startColor.max!.b! - startColor.min!.b!);
-    geometry.attributes.colorB.needsUpdate = true;
-
-    geometry.attributes.startFrame.array[particleIndex] =
-      textureSheetAnimation.startFrame
-        ? calculateValue(
-            generalData.particleSystemId,
-            textureSheetAnimation.startFrame,
-            0
-          )
-        : 0;
-    geometry.attributes.startFrame.needsUpdate = true;
-
-    geometry.attributes.startLifetime.array[particleIndex] =
-      calculateValue(
-        generalData.particleSystemId,
-        startLifetime,
-        generalData.normalizedLifetimePercentage
-      ) * 1000;
-    geometry.attributes.startLifetime.needsUpdate = true;
-
-    generalData.startValues.startSize[particleIndex] = calculateValue(
-      generalData.particleSystemId,
-      startSize,
-      generalData.normalizedLifetimePercentage
+  // rotationOverLifetime random per particle
+  if (rotOLActive) {
+    (generalData.lifetimeValues as any).rotationOverLifetime = Array.from({ length: maxP }, () =>
+      THREE.MathUtils.randFloat(rotationOverLifetime.min!, rotationOverLifetime.max!)
     );
-    geometry.attributes.size.array[particleIndex] =
-      generalData.startValues.startSize[particleIndex];
-    geometry.attributes.size.needsUpdate = true;
-
-    generalData.startValues.startOpacity[particleIndex] = calculateValue(
-      generalData.particleSystemId,
-      startOpacity,
-      generalData.normalizedLifetimePercentage
-    );
-    geometry.attributes.colorA.array[particleIndex] =
-      generalData.startValues.startOpacity[particleIndex];
-    geometry.attributes.colorA.needsUpdate = true;
-
-    geometry.attributes.rotation.array[particleIndex] = calculateValue(
-      generalData.particleSystemId,
-      startRotation,
-      generalData.normalizedLifetimePercentage
-    );
-    geometry.attributes.rotation.needsUpdate = true;
-
-    if (normalizedConfig.rotationOverLifetime.isActive)
-      generalData.lifetimeValues.rotationOverLifetime[particleIndex] =
-        THREE.MathUtils.randFloat(
-          normalizedConfig.rotationOverLifetime.min!,
-          normalizedConfig.rotationOverLifetime.max!
-        );
-
-    calculatePositionAndVelocity(
-      generalData,
-      shape,
-      startSpeed,
-      startPositions[particleIndex],
-      velocities[particleIndex]
-    );
-    const positionIndex = Math.floor(particleIndex * 3);
-    geometry.attributes.position.array[positionIndex] =
-      position.x + startPositions[particleIndex].x;
-    geometry.attributes.position.array[positionIndex + 1] =
-      position.y + startPositions[particleIndex].y;
-    geometry.attributes.position.array[positionIndex + 2] =
-      position.z + startPositions[particleIndex].z;
-    geometry.attributes.position.needsUpdate = true;
-
-    if (generalData.linearVelocityData) {
-      generalData.linearVelocityData[particleIndex].speed.set(
-        normalizedConfig.velocityOverLifetime.linear.x
-          ? calculateValue(
-              generalData.particleSystemId,
-              normalizedConfig.velocityOverLifetime.linear.x,
-              0
-            )
-          : 0,
-        normalizedConfig.velocityOverLifetime.linear.y
-          ? calculateValue(
-              generalData.particleSystemId,
-              normalizedConfig.velocityOverLifetime.linear.y,
-              0
-            )
-          : 0,
-        normalizedConfig.velocityOverLifetime.linear.z
-          ? calculateValue(
-              generalData.particleSystemId,
-              normalizedConfig.velocityOverLifetime.linear.z,
-              0
-            )
-          : 0
-      );
-    }
-
-    if (generalData.orbitalVelocityData) {
-      generalData.orbitalVelocityData[particleIndex].speed.set(
-        normalizedConfig.velocityOverLifetime.orbital.x
-          ? calculateValue(
-              generalData.particleSystemId,
-              normalizedConfig.velocityOverLifetime.orbital.x,
-              0
-            )
-          : 0,
-        normalizedConfig.velocityOverLifetime.orbital.y
-          ? calculateValue(
-              generalData.particleSystemId,
-              normalizedConfig.velocityOverLifetime.orbital.y,
-              0
-            )
-          : 0,
-        normalizedConfig.velocityOverLifetime.orbital.z
-          ? calculateValue(
-              generalData.particleSystemId,
-              normalizedConfig.velocityOverLifetime.orbital.z,
-              0
-            )
-          : 0
-      );
-      generalData.orbitalVelocityData[particleIndex].positionOffset.set(
-        startPositions[particleIndex].x,
-        startPositions[particleIndex].y,
-        startPositions[particleIndex].z
-      );
-    }
-
-    geometry.attributes.lifetime.array[particleIndex] = 0;
-    geometry.attributes.lifetime.needsUpdate = true;
-
-    applyModifiers({
-      delta: 0,
-      generalData,
-      normalizedConfig,
-      attributes: particleSystem.geometry.attributes,
-      particleLifetimePercentage: 0,
-      particleIndex,
-    });
-  };
-
-  let particleSystem = new THREE.Points(geometry, material);
-
-  particleSystem.position.copy(transform!.position!);
-  particleSystem.rotation.x = THREE.MathUtils.degToRad(transform.rotation!.x);
-  particleSystem.rotation.y = THREE.MathUtils.degToRad(transform.rotation!.y);
-  particleSystem.rotation.z = THREE.MathUtils.degToRad(transform.rotation!.z);
-  particleSystem.scale.copy(transform.scale!);
-
-  const calculatedCreationTime =
-    now + calculateValue(generalData.particleSystemId, startDelay) * 1000;
-
-  let wrapper: Gyroscope | undefined;
-  if (normalizedConfig.simulationSpace === SimulationSpace.WORLD) {
-    wrapper = new Gyroscope();
-    wrapper.add(particleSystem);
   }
 
-  createdParticleSystems.push({
-    particleSystem,
-    wrapper,
+  // velocityOverLifetime data (se attivo)
+  if (velocityOverLifetime?.isActive) {
+    generalData.linearVelocityData = Array.from({ length: maxP }, () => ({
+      speed: new THREE.Vector3(
+        velocityOverLifetime.linear.x ? calculateValue(generalData.particleSystemId, velocityOverLifetime.linear.x, 0) : 0,
+        velocityOverLifetime.linear.y ? calculateValue(generalData.particleSystemId, velocityOverLifetime.linear.y, 0) : 0,
+        velocityOverLifetime.linear.z ? calculateValue(generalData.particleSystemId, velocityOverLifetime.linear.z, 0) : 0
+      ),
+      valueModifiers: {
+        x: isLifeTimeCurve(velocityOverLifetime.linear.x || 0)
+          ? getCurveFunctionFromConfig(generalData.particleSystemId, velocityOverLifetime.linear.x as LifetimeCurve)
+          : undefined,
+        y: isLifeTimeCurve(velocityOverLifetime.linear.y || 0)
+          ? getCurveFunctionFromConfig(generalData.particleSystemId, velocityOverLifetime.linear.y as LifetimeCurve)
+          : undefined,
+        z: isLifeTimeCurve(velocityOverLifetime.linear.z || 0)
+          ? getCurveFunctionFromConfig(generalData.particleSystemId, velocityOverLifetime.linear.z as LifetimeCurve)
+          : undefined,
+      },
+    }));
+
+    generalData.orbitalVelocityData = Array.from({ length: maxP }, () => ({
+      speed: new THREE.Vector3(
+        velocityOverLifetime.orbital.x ? calculateValue(generalData.particleSystemId, velocityOverLifetime.orbital.x, 0) : 0,
+        velocityOverLifetime.orbital.y ? calculateValue(generalData.particleSystemId, velocityOverLifetime.orbital.y, 0) : 0,
+        velocityOverLifetime.orbital.z ? calculateValue(generalData.particleSystemId, velocityOverLifetime.orbital.z, 0) : 0
+      ),
+      valueModifiers: {
+        x: isLifeTimeCurve(velocityOverLifetime.orbital.x || 0)
+          ? getCurveFunctionFromConfig(generalData.particleSystemId, velocityOverLifetime.orbital.x as LifetimeCurve)
+          : undefined,
+        y: isLifeTimeCurve(velocityOverLifetime.orbital.y || 0)
+          ? getCurveFunctionFromConfig(generalData.particleSystemId, velocityOverLifetime.orbital.y as LifetimeCurve)
+          : undefined,
+        z: isLifeTimeCurve(velocityOverLifetime.orbital.z || 0)
+          ? getCurveFunctionFromConfig(generalData.particleSystemId, velocityOverLifetime.orbital.z as LifetimeCurve)
+          : undefined,
+      },
+      positionOffset: new THREE.Vector3(),
+    }));
+  }
+
+  // noise data (FIX: sampler created when "active" even w/out isActive)
+  (generalData.noise as any) = {
+    isActive: noiseActive,
+    strength: noise?.strength ?? 0,
+    positionAmount: noise?.positionAmount ?? 0,
+    rotationAmount: noise?.rotationAmount ?? 0,
+    sizeAmount: noise?.sizeAmount ?? 0,
+    sampler: noiseActive
+      ? new FBM({
+          seed: Math.random(),
+          scale: noise?.frequency ?? 0.5,
+          octaves: noise?.octaves ?? 1,
+        })
+      : undefined,
+    offsets: noiseActive && noise?.useRandomOffset
+      ? Array.from({ length: maxP }, () => Math.random() * 100)
+      : undefined,
+  };
+
+  // Init particles inactive
+  const isActiveAttr = _batchedPoints.geometry.getAttribute('isActive') as THREE.BufferAttribute;
+  const lifetimeAttr = _batchedPoints.geometry.getAttribute('lifetime') as THREE.BufferAttribute;
+  const colorAAttrInit = _batchedPoints.geometry.getAttribute('colorA') as THREE.BufferAttribute;
+
+  for (let i = 0; i < maxP; i++) {
+    const gi = startIndex + i;
+    isActiveAttr.array[gi] = 0;
+    lifetimeAttr.array[gi] = 0;
+    colorAAttrInit.array[gi] = 0;
+  }
+  isActiveAttr.needsUpdate = true;
+  lifetimeAttr.needsUpdate = true;
+  colorAAttrInit.needsUpdate = true;
+
+  _instanceData.set(generalData.particleSystemId, {
+    startIndex,
+    particleCount: maxP,
+    generalData,
+    instanceIndex,
+  });
+
+  // Per-system attributes
+  const instMatrixAttr = _batchedPoints.geometry.getAttribute('instanceMatrix') as THREE.BufferAttribute;
+  const instStartAttr = _batchedPoints.geometry.getAttribute('instanceStartIndex') as THREE.BufferAttribute;
+  const instCountAttr = _batchedPoints.geometry.getAttribute('instanceParticleCount') as THREE.BufferAttribute;
+  const instSimAttr = _batchedPoints.geometry.getAttribute('instanceSimulationSpace') as THREE.BufferAttribute;
+
+  instStartAttr.array[instanceIndex] = startIndex;
+  instCountAttr.array[instanceIndex] = maxP;
+  instSimAttr.array[instanceIndex] = simulationSpace === SimulationSpace.WORLD ? 1 : 0;
+
+  instStartAttr.needsUpdate = true;
+  instCountAttr.needsUpdate = true;
+  instSimAttr.needsUpdate = true;
+
+  (_batchedMaterial.uniforms.instanceStartIndex.value as Float32Array)[instanceIndex] = startIndex;
+  (_batchedMaterial.uniforms.instanceParticleCount.value as Float32Array)[instanceIndex] = maxP;
+  (_batchedMaterial.uniforms.instanceSimulationSpace.value as Float32Array)[instanceIndex] =
+    instSimAttr.array[instanceIndex];
+
+  _batchedMaterial.uniforms.instanceMatrixCount.value = Math.max(
+    _batchedMaterial.uniforms.instanceMatrixCount.value as number,
+    instanceIndex + 1
+  );
+
+  const worldPosition = transform.position?.clone() || new THREE.Vector3();
+  const worldScale = transform.scale?.clone() || new THREE.Vector3(1, 1, 1);
+
+  // ===== ROTATION FIX: compute baseQuat from config rotation (LOCAL behavior in old version) =====
+  _baseEuler.set(
+    THREE.MathUtils.degToRad(transform.rotation?.x || 0),
+    THREE.MathUtils.degToRad(transform.rotation?.y || 0),
+    THREE.MathUtils.degToRad(transform.rotation?.z || 0)
+  );
+  _baseQuat.setFromEuler(_baseEuler);
+  (generalData as any)._baseQuat = _baseQuat.clone();
+
+  const matrix = new THREE.Matrix4().compose(
+    worldPosition,
+    (generalData as any)._baseQuat,
+    worldScale
+  );
+
+  matrix.toArray(instMatrixAttr.array as any, instanceIndex * 16);
+  instMatrixAttr.needsUpdate = true;
+
+  setEmitterMatrix(generalData.particleSystemId, matrix);
+
+  if (map) _batchedMaterial.uniforms.map.value = map;
+
+  const calculatedCreationTime = now + calculateValue(generalData.particleSystemId, startDelay) * 1000;
+
+  const instanceData: any = {
+    instanceIndex,
+    particleSystem: _batchedPoints,
     generalData,
     onUpdate,
     onComplete,
     creationTime: calculatedCreationTime,
     lastEmissionTime: calculatedCreationTime,
+    emissionCarry: 0,
     duration,
     looping,
     simulationSpace,
@@ -854,38 +693,153 @@ export const createParticleSystem = (
     normalizedConfig,
     iterationCount: 0,
     velocities,
-    deactivateParticle,
-    activateParticle,
-  });
+    startIndex,
+    maxParticles: maxP,
+    startPositions,
+
+    deactivateParticle: (particleIndex: number) => {
+      const gi = startIndex + particleIndex;
+      (_batchedPoints!.geometry.getAttribute('isActive') as THREE.BufferAttribute).array[gi] = 0;
+      (_batchedPoints!.geometry.getAttribute('colorA') as THREE.BufferAttribute).array[gi] = 0;
+
+      (_batchedPoints!.geometry.getAttribute('isActive') as THREE.BufferAttribute).needsUpdate = true;
+      (_batchedPoints!.geometry.getAttribute('colorA') as THREE.BufferAttribute).needsUpdate = true;
+    },
+
+    activateParticle: ({
+      particleIndex,
+      activationTime,
+      position,
+    }: {
+      particleIndex: number;
+      activationTime: number;
+      position: Required<Point3D>;
+    }) => {
+      const gi = startIndex + particleIndex;
+
+      const positionAttr = _batchedPoints!.geometry.getAttribute('position') as THREE.BufferAttribute;
+      const isActiveAttr2 = _batchedPoints!.geometry.getAttribute('isActive') as THREE.BufferAttribute;
+      const lifetimeAttr2 = _batchedPoints!.geometry.getAttribute('lifetime') as THREE.BufferAttribute;
+      const rotationAttr = _batchedPoints!.geometry.getAttribute('rotation') as THREE.BufferAttribute;
+      const startLifetimeAttr2 = _batchedPoints!.geometry.getAttribute('startLifetime') as THREE.BufferAttribute;
+      const sizeAttr = _batchedPoints!.geometry.getAttribute('size') as THREE.BufferAttribute;
+
+      // ===== FIX 1: spawnOffset + shapeOffset (old editor behavior) =====
+      const sp = instanceData.startPositions[particleIndex] as THREE.Vector3;
+      positionAttr.array[gi * 3 + 0] = (position.x || 0) + sp.x;
+      positionAttr.array[gi * 3 + 1] = (position.y || 0) + sp.y;
+      positionAttr.array[gi * 3 + 2] = (position.z || 0) + sp.z;
+
+      isActiveAttr2.array[gi] = 1;
+      lifetimeAttr2.array[gi] = 0;
+
+      rotationAttr.array[gi] = calculateValue(
+        generalData.particleSystemId,
+        startRotation,
+        generalData.normalizedLifetimePercentage
+      );
+
+      generalData.creationTimes[particleIndex] = activationTime;
+
+      if ((generalData.noise as any).offsets) (generalData.noise as any).offsets[particleIndex] = Math.random() * 100;
+
+      const colorRandomRatio = Math.random();
+      const colorRAttr = _batchedPoints!.geometry.getAttribute('colorR') as THREE.BufferAttribute;
+      const colorGAttr = _batchedPoints!.geometry.getAttribute('colorG') as THREE.BufferAttribute;
+      const colorBAttr = _batchedPoints!.geometry.getAttribute('colorB') as THREE.BufferAttribute;
+      const colorAAttr = _batchedPoints!.geometry.getAttribute('colorA') as THREE.BufferAttribute;
+
+      colorRAttr.array[gi] = startColor.min!.r! + colorRandomRatio * (startColor.max!.r! - startColor.min!.r!);
+      colorGAttr.array[gi] = startColor.min!.g! + colorRandomRatio * (startColor.max!.g! - startColor.min!.g!);
+      colorBAttr.array[gi] = startColor.min!.b! + colorRandomRatio * (startColor.max!.b! - startColor.min!.b!);
+
+      (generalData.startValues as any).startOpacity[particleIndex] = calculateValue(
+        generalData.particleSystemId,
+        startOpacity,
+        generalData.normalizedLifetimePercentage
+      );
+      colorAAttr.array[gi] = (generalData.startValues as any).startOpacity[particleIndex];
+
+      startLifetimeAttr2.array[gi] =
+        calculateValue(generalData.particleSystemId, startLifetime, generalData.normalizedLifetimePercentage) * 1000;
+
+      (generalData.startValues as any).startSize[particleIndex] = calculateValue(
+        generalData.particleSystemId,
+        startSize,
+        generalData.normalizedLifetimePercentage
+      );
+      sizeAttr.array[gi] = (generalData.startValues as any).startSize[particleIndex];
+
+      if (rotOLActive && (generalData.lifetimeValues as any).rotationOverLifetime) {
+        (generalData.lifetimeValues as any).rotationOverLifetime[particleIndex] = THREE.MathUtils.randFloat(
+          rotationOverLifetime.min!,
+          rotationOverLifetime.max!
+        );
+      }
+
+      const emitterIndexAttr = _batchedPoints!.geometry.getAttribute('emitterIndex') as THREE.BufferAttribute;
+      emitterIndexAttr.array[gi] = instanceData.instanceIndex;
+
+      applyModifiers({
+        delta: 0,
+        generalData,
+        normalizedConfig,
+        attributes: _batchedPoints!.geometry.attributes as any,
+        particleLifetimePercentage: 0,
+        particleIndex,
+        globalIndex: gi,
+      });
+
+      positionAttr.needsUpdate = true;
+      isActiveAttr2.needsUpdate = true;
+      lifetimeAttr2.needsUpdate = true;
+      rotationAttr.needsUpdate = true;
+      startLifetimeAttr2.needsUpdate = true;
+      sizeAttr.needsUpdate = true;
+
+      colorRAttr.needsUpdate = true;
+      colorGAttr.needsUpdate = true;
+      colorBAttr.needsUpdate = true;
+      colorAAttr.needsUpdate = true;
+
+      emitterIndexAttr.needsUpdate = true;
+    },
+  };
+
+  createdParticleSystems.push(instanceData);
 
   const resumeEmitter = () => (generalData.isEnabled = true);
   const pauseEmitter = () => (generalData.isEnabled = false);
-  const dispose = () => destroyParticleSystem(particleSystem);
+  const dispose = () => destroyParticleSystem(generalData.particleSystemId);
 
   return {
-    instance: wrapper || particleSystem,
+    instance: _batchedPoints,
+    generalData,
     resumeEmitter,
     pauseEmitter,
     dispose,
-  };
+  } as any;
 };
 
 export const updateParticleSystems = ({ now, delta, elapsed }: CycleData) => {
+  if (!_batchedPoints || !_batchedMaterial) return;
+
+  _batchedMaterial.uniforms.elapsed.value = elapsed;
+
   createdParticleSystems.forEach((props) => {
     const {
+      instanceIndex,
       onUpdate,
       generalData,
       onComplete,
-      particleSystem,
-      wrapper,
       creationTime,
-      lastEmissionTime,
       duration,
       looping,
       emission,
       normalizedConfig,
-      iterationCount,
       velocities,
+      startIndex,
+      maxParticles,
       deactivateParticle,
       activateParticle,
       simulationSpace,
@@ -893,12 +847,10 @@ export const updateParticleSystems = ({ now, delta, elapsed }: CycleData) => {
     } = props;
 
     const lifetime = now - creationTime;
-    const normalizedLifetime = lifetime % (duration * 1000);
+    const durationMs = (duration ?? 0) * 1000;
 
-    generalData.normalizedLifetimePercentage = Math.max(
-      Math.min(normalizedLifetime / (duration * 1000), 1),
-      0
-    );
+    generalData.normalizedLifetimePercentage =
+      duration > 0 ? Math.max(Math.min((lifetime % durationMs) / durationMs, 1), 0) : 0;
 
     const {
       lastWorldPosition,
@@ -908,25 +860,13 @@ export const updateParticleSystems = ({ now, delta, elapsed }: CycleData) => {
       worldQuaternion,
       worldEuler,
       gravityVelocity,
-      isEnabled,
     } = generalData;
 
-    if (wrapper?.parent)
-      generalData.wrapperQuaternion.copy(wrapper.parent.quaternion);
-
-    const lastWorldPositionSnapshot = { ...lastWorldPosition };
-
-    if (Array.isArray(particleSystem.material))
-      particleSystem.material.forEach((material) => {
-        if (material instanceof THREE.ShaderMaterial)
-          material.uniforms.elapsed.value = elapsed;
-      });
-    else {
-      if (particleSystem.material instanceof THREE.ShaderMaterial)
-        particleSystem.material.uniforms.elapsed.value = elapsed;
+    if (_getEmitterTRS(instanceIndex, _tmpPos, _tmpQuat, _tmpScale)) {
+      currentWorldPosition.copy(_tmpPos);
+      worldQuaternion.copy(_tmpQuat);
     }
 
-    particleSystem.getWorldPosition(currentWorldPosition);
     if (lastWorldPosition.x !== -99999) {
       worldPositionChange.set(
         currentWorldPosition.x - lastWorldPosition.x,
@@ -935,182 +875,254 @@ export const updateParticleSystems = ({ now, delta, elapsed }: CycleData) => {
       );
     }
     generalData.distanceFromLastEmitByDistance += worldPositionChange.length();
-    particleSystem.getWorldPosition(lastWorldPosition);
-    particleSystem.getWorldQuaternion(worldQuaternion);
+    lastWorldPosition.copy(currentWorldPosition);
+
     if (
-      lastWorldQuaternion.x === -99999 ||
+      (lastWorldQuaternion as any).x === -99999 ||
       lastWorldQuaternion.x !== worldQuaternion.x ||
       lastWorldQuaternion.y !== worldQuaternion.y ||
       lastWorldQuaternion.z !== worldQuaternion.z
     ) {
       worldEuler.setFromQuaternion(worldQuaternion);
       lastWorldQuaternion.copy(worldQuaternion);
-      gravityVelocity.set(
-        lastWorldPosition.x,
-        lastWorldPosition.y + gravity,
-        lastWorldPosition.z
-      );
-      particleSystem.worldToLocal(gravityVelocity);
+
+      gravityVelocity.set(lastWorldPosition.x, lastWorldPosition.y + gravity, lastWorldPosition.z);
+
+      if (_readEmitterMatrix(instanceIndex, _tmpMat)) {
+        _tmpMatInv.copy(_tmpMat).invert();
+        gravityVelocity.applyMatrix4(_tmpMatInv);
+      }
     }
 
-    generalData.creationTimes.forEach((entry, index) => {
-      if (particleSystem.geometry.attributes.isActive.array[index]) {
-        const particleLifetime = now - entry;
-        if (
-          particleLifetime >
-          particleSystem.geometry.attributes.startLifetime.array[index]
-        )
-          deactivateParticle(index);
-        else {
-          const velocity = velocities[index];
-          velocity.x -= gravityVelocity.x * delta;
-          velocity.y -= gravityVelocity.y * delta;
-          velocity.z -= gravityVelocity.z * delta;
+    // ========== EMISSIONE ==========
+    if (generalData.isEnabled && (looping || duration === 0 || lifetime < durationMs)) {
+      const rateOverTime = Math.max(
+        0,
+        calculateValue(generalData.particleSystemId, emission.rateOverTime, generalData.normalizedLifetimePercentage)
+      );
 
-          if (
-            gravity !== 0 ||
-            velocity.x !== 0 ||
-            velocity.y !== 0 ||
-            velocity.z !== 0 ||
-            worldPositionChange.x !== 0 ||
-            worldPositionChange.y !== 0 ||
-            worldPositionChange.z !== 0
-          ) {
-            const positionIndex = index * 3;
-            const positionArr =
-              particleSystem.geometry.attributes.position.array;
+      if (rateOverTime > 0) {
+        const timeSinceLastEmitMs = now - props.lastEmissionTime;
 
-            if (simulationSpace === SimulationSpace.WORLD) {
-              positionArr[positionIndex] -= worldPositionChange.x;
-              positionArr[positionIndex + 1] -= worldPositionChange.y;
-              positionArr[positionIndex + 2] -= worldPositionChange.z;
+        const totalToEmit = (timeSinceLastEmitMs * rateOverTime) / 1000 + (props.emissionCarry || 0);
+        const emitCount = Math.floor(totalToEmit);
+        props.emissionCarry = totalToEmit - emitCount;
+
+        for (let e = 0; e < emitCount; e++) {
+          let freeIndex = -1;
+          const isActiveAttr = _batchedPoints!.geometry.getAttribute('isActive') as THREE.BufferAttribute;
+          for (let i = 0; i < maxParticles; i++) {
+            const gi = startIndex + i;
+            if (isActiveAttr.array[gi] < 0.5) {
+              freeIndex = i;
+              break;
             }
+          }
+          if (freeIndex === -1) break;
 
-            positionArr[positionIndex] += velocity.x * delta;
-            positionArr[positionIndex + 1] += velocity.y * delta;
-            positionArr[positionIndex + 2] += velocity.z * delta;
-            particleSystem.geometry.attributes.position.needsUpdate = true;
+          // ===== FIX 2: compute shapeOffset + velocity and store them (old editor behavior) =====
+          const shapeOffset = new THREE.Vector3();
+          const spawnedVelocity = new THREE.Vector3();
+
+          // ROTATION FIX: apply baseQuat (config rotation) + emitter TRS rotation if WORLD
+          const baseQuat: THREE.Quaternion | undefined = (generalData as any)._baseQuat;
+
+          if (simulationSpace === SimulationSpace.WORLD) {
+            if (_getEmitterTRS(instanceIndex, _tmpPos, _tmpQuat, _tmpScale)) {
+              generalData.wrapperQuaternion.copy(_tmpQuat);
+              if (baseQuat) generalData.wrapperQuaternion.multiply(baseQuat);
+            } else {
+              generalData.wrapperQuaternion.copy(baseQuat ?? new THREE.Quaternion());
+            }
+          } else {
+            generalData.wrapperQuaternion.copy(baseQuat ?? new THREE.Quaternion());
           }
 
-          particleSystem.geometry.attributes.lifetime.array[index] =
-            particleLifetime;
-          particleSystem.geometry.attributes.lifetime.needsUpdate = true;
-
-          const particleLifetimePercentage =
-            particleLifetime /
-            particleSystem.geometry.attributes.startLifetime.array[index];
-          applyModifiers({
-            delta,
+          // shapeOffset + spawnedVelocity (like old calculatePositionAndVelocity into startPositions + velocities)
+          calculatePositionAndVelocity(
             generalData,
-            normalizedConfig,
-            attributes: particleSystem.geometry.attributes,
-            particleLifetimePercentage,
-            particleIndex: index,
-          });
-        }
-      }
-    });
-
-    if (isEnabled && (looping || lifetime < duration * 1000)) {
-      const emissionDelta = now - lastEmissionTime;
-      const neededParticlesByTime = emission.rateOverTime
-        ? Math.floor(
-            calculateValue(
-              generalData.particleSystemId,
-              emission.rateOverTime,
-              generalData.normalizedLifetimePercentage
-            ) *
-              (emissionDelta / 1000)
-          )
-        : 0;
-
-      const rateOverDistance = emission.rateOverDistance
-        ? calculateValue(
-            generalData.particleSystemId,
-            emission.rateOverDistance,
-            generalData.normalizedLifetimePercentage
-          )
-        : 0;
-      const neededParticlesByDistance =
-        rateOverDistance > 0 && generalData.distanceFromLastEmitByDistance > 0
-          ? Math.floor(
-              generalData.distanceFromLastEmitByDistance /
-                (1 / rateOverDistance!)
-            )
-          : 0;
-      const distanceStep =
-        neededParticlesByDistance > 0
-          ? {
-              x:
-                (currentWorldPosition.x - lastWorldPositionSnapshot.x) /
-                neededParticlesByDistance,
-              y:
-                (currentWorldPosition.y - lastWorldPositionSnapshot.y) /
-                neededParticlesByDistance,
-              z:
-                (currentWorldPosition.z - lastWorldPositionSnapshot.z) /
-                neededParticlesByDistance,
-            }
-          : null;
-      const neededParticles = neededParticlesByTime + neededParticlesByDistance;
-
-      if (rateOverDistance > 0 && neededParticlesByDistance >= 1) {
-        generalData.distanceFromLastEmitByDistance = 0;
-      }
-
-      if (neededParticles > 0) {
-        let generatedParticlesByDistanceNeeds = 0;
-        for (let i = 0; i < neededParticles; i++) {
-          let particleIndex = -1;
-          particleSystem.geometry.attributes.isActive.array.find(
-            (isActive, index) => {
-              if (!isActive) {
-                particleIndex = index;
-                return true;
-              }
-              return false;
-            }
+            normalizedConfig.shape,
+            normalizedConfig.startSpeed,
+            shapeOffset,
+            spawnedVelocity
           );
 
-          if (
-            particleIndex !== -1 &&
-            particleIndex <
-              particleSystem.geometry.attributes.isActive.array.length
-          ) {
-            let position: Required<Point3D> = { x: 0, y: 0, z: 0 };
-            if (
-              distanceStep &&
-              generatedParticlesByDistanceNeeds < neededParticlesByDistance
-            ) {
-              position = {
-                x: distanceStep.x * generatedParticlesByDistanceNeeds,
-                y: distanceStep.y * generatedParticlesByDistanceNeeds,
-                z: distanceStep.z * generatedParticlesByDistanceNeeds,
-              };
-              generatedParticlesByDistanceNeeds++;
-            }
-            activateParticle({
-              particleIndex,
-              activationTime: now,
-              position,
-            });
-            props.lastEmissionTime = now;
-          }
+          // store for this particle index
+          (props.startPositions[freeIndex] as THREE.Vector3).copy(shapeOffset);
+          velocities[freeIndex].copy(spawnedVelocity);
+
+          // spawn offset only (WORLD uses emitter pos; LOCAL is 0)
+          const spawnOffset =
+            simulationSpace === SimulationSpace.WORLD
+              ? { x: lastWorldPosition.x, y: lastWorldPosition.y, z: lastWorldPosition.z }
+              : { x: 0, y: 0, z: 0 };
+
+          activateParticle({
+            particleIndex: freeIndex,
+            activationTime: now,
+            position: spawnOffset,
+          });
+
+          props.lastEmissionTime = now;
         }
       }
+    }
 
-      if (onUpdate)
-        onUpdate({
-          particleSystem,
+    // ========== UPDATE PARTICELLE ==========
+    const positionAttr = _batchedPoints!.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const isActiveAttr = _batchedPoints!.geometry.getAttribute('isActive') as THREE.BufferAttribute;
+    const lifetimeAttr = _batchedPoints!.geometry.getAttribute('lifetime') as THREE.BufferAttribute;
+    const startLifetimeAttr = _batchedPoints!.geometry.getAttribute('startLifetime') as THREE.BufferAttribute;
+
+    const sizeAttr = _batchedPoints!.geometry.getAttribute('size') as THREE.BufferAttribute;
+    const rotationAttr = _batchedPoints!.geometry.getAttribute('rotation') as THREE.BufferAttribute;
+    const colorAAttr = _batchedPoints!.geometry.getAttribute('colorA') as THREE.BufferAttribute;
+
+    let anyPositionChanged = false;
+    let anyLifetimeChanged = false;
+    let anyVisualChanged = false;
+
+    for (let i = 0; i < maxParticles; i++) {
+      const gi = startIndex + i;
+
+      if (isActiveAttr.array[gi] > 0.5) {
+        const particleLifetimeMs = now - generalData.creationTimes[i];
+        const startLifetimeMs = startLifetimeAttr.array[gi];
+
+        if (particleLifetimeMs > startLifetimeMs) {
+          deactivateParticle(i);
+          continue;
+        }
+
+        const velocity = velocities[i];
+
+        velocity.x -= gravityVelocity.x * delta;
+        velocity.y -= gravityVelocity.y * delta;
+        velocity.z -= gravityVelocity.z * delta;
+
+        const positionIndex = gi * 3;
+        const positionArr = positionAttr.array as any as number[];
+
+        if (simulationSpace === SimulationSpace.WORLD) {
+          positionArr[positionIndex] -= worldPositionChange.x;
+          positionArr[positionIndex + 1] -= worldPositionChange.y;
+          positionArr[positionIndex + 2] -= worldPositionChange.z;
+        }
+
+        positionArr[positionIndex] += velocity.x * delta;
+        positionArr[positionIndex + 1] += velocity.y * delta;
+        positionArr[positionIndex + 2] += velocity.z * delta;
+
+        anyPositionChanged = true;
+
+        lifetimeAttr.array[gi] = particleLifetimeMs;
+        anyLifetimeChanged = true;
+
+        const particleLifetimePercentage = startLifetimeMs > 0 ? particleLifetimeMs / startLifetimeMs : 0;
+
+        applyModifiers({
           delta,
-          elapsed,
-          lifetime,
-          normalizedLifetime,
-          iterationCount: iterationCount + 1,
+          generalData,
+          normalizedConfig,
+          attributes: _batchedPoints!.geometry.attributes as any,
+          particleLifetimePercentage,
+          particleIndex: i,
+          globalIndex: gi,
         });
-    } else if (onComplete)
-      onComplete({
-        particleSystem,
+
+        anyVisualChanged = true;
+      }
+    }
+
+    if (anyPositionChanged) positionAttr.needsUpdate = true;
+    if (anyLifetimeChanged) lifetimeAttr.needsUpdate = true;
+
+    if (anyVisualChanged) {
+      sizeAttr.needsUpdate = true;
+      rotationAttr.needsUpdate = true;
+      colorAAttr.needsUpdate = true;
+    }
+
+    props.iterationCount = (props.iterationCount ?? 0) + 1;
+
+    if (onUpdate) {
+      onUpdate({
+        particleSystem: _batchedPoints!,
+        delta,
+        elapsed,
+        lifetime,
+        normalizedLifetime: generalData.normalizedLifetimePercentage * (duration ?? 0) * 1000,
+        iterationCount: props.iterationCount,
       });
+    } else if (!looping && lifetime >= durationMs && onComplete) {
+      onComplete({ particleSystem: _batchedPoints! });
+    }
   });
 };
+
+export const getBatchedPoints = () => _batchedPoints;
+export const getInstanceData = () => _instanceData;
+
+export const setEmitterMatrix = (particleSystemId: number, matrix: THREE.Matrix4) => {
+  if (!_batchedPoints || !_batchedMaterial) return;
+  const meta = _instanceData.get(particleSystemId);
+  if (!meta) return;
+
+  const instMatrixAttr = _batchedPoints.geometry.getAttribute('instanceMatrix') as THREE.BufferAttribute;
+  if (instMatrixAttr) {
+    matrix.toArray(instMatrixAttr.array as any, meta.instanceIndex * 16);
+    instMatrixAttr.needsUpdate = true;
+  }
+
+  const i = meta.instanceIndex;
+  const e = matrix.elements;
+
+  _batchedMaterial.uniforms.instanceMat0.value[i].set(e[0], e[1], e[2], e[3]);
+  _batchedMaterial.uniforms.instanceMat1.value[i].set(e[4], e[5], e[6], e[7]);
+  _batchedMaterial.uniforms.instanceMat2.value[i].set(e[8], e[9], e[10], e[11]);
+  _batchedMaterial.uniforms.instanceMat3.value[i].set(e[12], e[13], e[14], e[15]);
+};
+
+export const setEmitterPosition = (particleSystemId: number, x: number, y: number, z: number) => {
+  if (!_batchedPoints) return;
+  const meta = _instanceData.get(particleSystemId);
+  if (!meta) return;
+
+  if (!_readEmitterMatrix(meta.instanceIndex, _tmpMat)) return;
+  _tmpMat.decompose(_tmpPos, _tmpQuat, _tmpScale);
+
+  _tmpPos.set(x, y, z);
+  _tmpMat.compose(_tmpPos, _tmpQuat, _tmpScale);
+
+  setEmitterMatrix(particleSystemId, _tmpMat);
+};
+
+export const setEmitterRotation = (particleSystemId: number, q: THREE.Quaternion) => {
+  if (!_batchedPoints) return;
+  const meta = _instanceData.get(particleSystemId);
+  if (!meta) return;
+
+  if (!_readEmitterMatrix(meta.instanceIndex, _tmpMat)) return;
+  _tmpMat.decompose(_tmpPos, _tmpQuat, _tmpScale);
+
+  _tmpQuat.copy(q);
+  _tmpMat.compose(_tmpPos, _tmpQuat, _tmpScale);
+
+  setEmitterMatrix(particleSystemId, _tmpMat);
+};
+
+export const setEmitterScale = (particleSystemId: number, sx: number, sy: number, sz: number) => {
+  if (!_batchedPoints) return;
+  const meta = _instanceData.get(particleSystemId);
+  if (!meta) return;
+
+  if (!_readEmitterMatrix(meta.instanceIndex, _tmpMat)) return;
+  _tmpMat.decompose(_tmpPos, _tmpQuat, _tmpScale);
+
+  _tmpScale.set(sx, sy, sz);
+  _tmpMat.compose(_tmpPos, _tmpQuat, _tmpScale);
+
+  setEmitterMatrix(particleSystemId, _tmpMat);
+};
+
+export { _batchedPoints as createParticleRenderObject, _instanceData };

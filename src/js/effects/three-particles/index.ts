@@ -4,5 +4,3 @@ export * from './three-particles-enums.js';
 export * from './three-particles-modifiers.js';
 export * from './three-particles-utils.js';
 export * from './three-particles.js';
-
-export * from './three-particles-batched.js';

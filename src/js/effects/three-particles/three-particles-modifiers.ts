@@ -1,26 +1,35 @@
 import * as THREE from 'three';
 
 import { calculateValue } from './three-particles-utils.js';
-import { GeneralData, NormalizedParticleSystemConfig } from './types.js';
+import type { GeneralData, NormalizedParticleSystemConfig } from './types.js';
 
 const noiseInput = new THREE.Vector3(0, 0, 0);
 const orbitalEuler = new THREE.Euler();
 
-export const applyModifiers = ({
-  delta,
-  generalData,
-  normalizedConfig,
-  attributes,
-  particleLifetimePercentage,
-  particleIndex,
-}: {
+type ApplyModifiersParams = {
   delta: number;
   generalData: GeneralData;
   normalizedConfig: NormalizedParticleSystemConfig;
   attributes: THREE.NormalBufferAttributes;
   particleLifetimePercentage: number;
-  particleIndex: number;
-}) => {
+  particleIndex: number;   // local index
+  globalIndex?: number;    // optional global index for batched buffers
+};
+
+export const applyModifiers = (params: ApplyModifiersParams) => {
+  const {
+    delta,
+    generalData,
+    normalizedConfig,
+    attributes,
+    particleLifetimePercentage,
+    particleIndex,
+    globalIndex,
+  } = params;
+
+  const li = particleIndex;
+  const gi = globalIndex ?? particleIndex;
+
   const {
     particleSystemId,
     startValues,
@@ -30,11 +39,11 @@ export const applyModifiers = ({
     noise,
   } = generalData;
 
-  const positionIndex = particleIndex * 3;
+  const positionIndex = gi * 3;
   const positionArr = attributes.position.array;
 
   if (linearVelocityData) {
-    const { speed, valueModifiers } = linearVelocityData[particleIndex];
+    const { speed, valueModifiers } = linearVelocityData[li];
 
     const normalizedXSpeed = valueModifiers.x
       ? valueModifiers.x(particleLifetimePercentage)
@@ -56,8 +65,7 @@ export const applyModifiers = ({
   }
 
   if (orbitalVelocityData) {
-    const { speed, positionOffset, valueModifiers } =
-      orbitalVelocityData[particleIndex];
+    const { speed, positionOffset, valueModifiers } = orbitalVelocityData[li];
 
     positionArr[positionIndex] -= positionOffset.x;
     positionArr[positionIndex + 1] -= positionOffset.y;
@@ -80,6 +88,7 @@ export const applyModifiers = ({
       normalizedZSpeed * delta,
       normalizedYSpeed * delta
     );
+
     positionOffset.applyEuler(orbitalEuler);
 
     positionArr[positionIndex] += positionOffset.x;
@@ -95,8 +104,8 @@ export const applyModifiers = ({
       normalizedConfig.sizeOverLifetime.lifetimeCurve,
       particleLifetimePercentage
     );
-    attributes.size.array[particleIndex] =
-      startValues.startSize[particleIndex] * multiplier;
+
+    attributes.size.array[gi] = startValues.startSize[li] * multiplier;
     attributes.size.needsUpdate = true;
   }
 
@@ -106,14 +115,14 @@ export const applyModifiers = ({
       normalizedConfig.opacityOverLifetime.lifetimeCurve,
       particleLifetimePercentage
     );
-    attributes.colorA.array[particleIndex] =
-      startValues.startOpacity[particleIndex] * multiplier;
+
+    attributes.colorA.array[gi] = startValues.startOpacity[li] * multiplier;
     attributes.colorA.needsUpdate = true;
   }
 
   if (lifetimeValues.rotationOverLifetime) {
-    attributes.rotation.array[particleIndex] +=
-      lifetimeValues.rotationOverLifetime[particleIndex] * delta * 0.02;
+    attributes.rotation.array[gi] +=
+      lifetimeValues.rotationOverLifetime[li] * delta * 0.02;
     attributes.rotation.needsUpdate = true;
   }
 
@@ -126,40 +135,41 @@ export const applyModifiers = ({
       rotationAmount,
       sizeAmount,
     } = noise;
-    let noiseOnPosition;
 
     const noisePosition =
-      (particleLifetimePercentage + (offsets ? offsets[particleIndex] : 0)) *
-      10 *
-      strength;
+      (particleLifetimePercentage + (offsets ? offsets[li] : 0)) * 10 * strength;
+
     const noisePower = 0.15 * strength;
 
+    // X
     noiseInput.set(noisePosition, 0, 0);
-    noiseOnPosition = sampler!.get3(noiseInput);
+    let noiseOnPosition = sampler!.get3(noiseInput);
     positionArr[positionIndex] += noiseOnPosition * noisePower * positionAmount;
 
     if (rotationAmount !== 0) {
-      attributes.rotation.array[particleIndex] +=
+      attributes.rotation.array[gi] +=
         noiseOnPosition * noisePower * rotationAmount;
       attributes.rotation.needsUpdate = true;
     }
 
     if (sizeAmount !== 0) {
-      attributes.size.array[particleIndex] +=
-        noiseOnPosition * noisePower * sizeAmount;
+      attributes.size.array[gi] += noiseOnPosition * noisePower * sizeAmount;
       attributes.size.needsUpdate = true;
     }
 
+    // Y
     noiseInput.set(noisePosition, noisePosition, 0);
     noiseOnPosition = sampler!.get3(noiseInput);
     positionArr[positionIndex + 1] +=
       noiseOnPosition * noisePower * positionAmount;
 
+    // Z
     noiseInput.set(noisePosition, noisePosition, noisePosition);
     noiseOnPosition = sampler!.get3(noiseInput);
     positionArr[positionIndex + 2] +=
       noiseOnPosition * noisePower * positionAmount;
 
     attributes.position.needsUpdate = true;
+    
   }
 };
