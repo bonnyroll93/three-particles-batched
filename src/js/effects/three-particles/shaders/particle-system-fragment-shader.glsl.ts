@@ -1,72 +1,57 @@
-const ParticleSystemFragmentShader = `
+const ParticleSystemFragmentShader = /* glsl */ `
   uniform sampler2D map;
-  uniform float elapsed;
-  uniform float fps;
-  uniform bool useFPSForFrameIndex;
-  uniform vec2 tiles;
   uniform bool discardBackgroundColor;
   uniform vec3 backgroundColor;
   uniform float backgroundColorTolerance;
 
   varying vec4 vColor;
-  varying float vLifetime;
-  varying float vStartLifetime;
-  varying float vRotation;
-  varying float vStartFrame;
+  varying vec2 vRotSC;        // (sin, cos) dal vertex
+  varying vec2 vTileOffset;   // offset UV (0..1) della cella
+  varying vec2 vTileScale;    // scale UV (0..1) della cella: (1/cols, 1/rows)
 
   #include <common>
   #include <logdepthbuf_pars_fragment>
 
-  void main()
-  {
-    gl_FragColor = vColor;
-    float mid = 0.5;
-
-    float frameIndex = round(vStartFrame) + (
-      useFPSForFrameIndex == true
-        ? fps == 0.0
-            ? 0.0
-            : max((vLifetime / 1000.0) * fps, 0.0)
-        : max(min(floor(min(vLifetime / vStartLifetime, 1.0) * (tiles.x * tiles.y)), tiles.x * tiles.y - 1.0), 0.0)
-    );
-        
-    float spriteXIndex = floor(mod(frameIndex, tiles.x));
-    float spriteYIndex = floor(mod(frameIndex / tiles.x, tiles.y));
-
-    vec2 frameUV = vec2(
-      gl_PointCoord.x / tiles.x + spriteXIndex / tiles.x,
-      gl_PointCoord.y / tiles.y + spriteYIndex / tiles.y);
-
+  void main() {
     vec2 center = vec2(0.5, 0.5);
-    vec2 centeredPoint = gl_PointCoord - center;
+    vec2 p = gl_PointCoord - center;
 
-    mat2 rotation = mat2(
-      cos(vRotation), sin(vRotation),
-      -sin(vRotation), cos(vRotation)
+    // rotazione usando sin/cos precomputati
+    float s = vRotSC.x;
+    float c = vRotSC.y;
+    vec2 pr = vec2(
+      c * p.x + s * p.y,
+      -s * p.x + c * p.y
     );
 
-    centeredPoint = rotation * centeredPoint;
-    vec2 centeredMiddlePoint = vec2(
-      centeredPoint.x + center.x,
-      centeredPoint.y + center.y
-    );
+    // UV nello sprite (0..1) dopo rotazione attorno al centro
+    vec2 uvSprite = pr + center;
 
-    float dist = distance(centeredMiddlePoint, center);
-    if (dist > 0.5) discard;
+    // Spritesheet UV: prendi la cella (offset) e scala l’uv dentro la cella
+    vec2 uvAtlas = vTileOffset + uvSprite * vTileScale;
 
-    vec2 uvPoint = vec2(
-      centeredMiddlePoint.x / tiles.x + spriteXIndex / tiles.x,
-      centeredMiddlePoint.y / tiles.y + spriteYIndex / tiles.y
-    );
+    vec4 tex = texture2D(map, uvAtlas);
+    vec4 outColor = vColor * tex;
 
-    vec4 rotatedTexture = texture2D(map, uvPoint);
+    // Alpha mask circolare SOFT (no discard)
+    float r2 = dot(pr, pr);
 
-    gl_FragColor = gl_FragColor * rotatedTexture;
+    float feather = 0.04;
+    float inner = 0.25 - feather;
+    float outer = 0.25;
 
-    if (discardBackgroundColor && abs(length(rotatedTexture.rgb - backgroundColor.rgb)) < backgroundColorTolerance) discard;
-    
+    float mask = 1.0 - smoothstep(inner, outer, r2);
+    outColor.a *= mask;
+
+    if (discardBackgroundColor) {
+      float d = length(tex.rgb - backgroundColor.rgb);
+      float keep = step(backgroundColorTolerance, d);
+      outColor.a *= keep;
+    }
+
+    gl_FragColor = outColor;
+
     #include <logdepthbuf_fragment>
   }
 `;
-
 export default ParticleSystemFragmentShader;

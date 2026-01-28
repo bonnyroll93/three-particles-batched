@@ -391,6 +391,10 @@ const _tmpMatInv = new THREE.Matrix4();
 const _baseEuler = new THREE.Euler();
 const _baseQuat = new THREE.Quaternion();
 
+const _shapeOffset = new THREE.Vector3();
+const _spawnedVelocity = new THREE.Vector3();
+const _invBaseQuat = new THREE.Quaternion();
+
 const _readEmitterMatrix = (instanceIndex: number, out: THREE.Matrix4) => {
   if (!_batchedPoints) return false;
   const instMatrixAttr = _batchedPoints.geometry.getAttribute('instanceMatrix') as THREE.BufferAttribute;
@@ -513,19 +517,16 @@ export const createParticleSystem = (
   const velocities = Array.from({ length: maxP }, () => new THREE.Vector3());
   const startPositions = Array.from({ length: maxP }, () => new THREE.Vector3());
 
-  // ===== FIX: consider "active" even without isActive (Pixel Fire style) =====
-  const rotOLActive =
-    rotationOverLifetime &&
-    (rotationOverLifetime.isActive === true ||
-      (rotationOverLifetime.min !== undefined && rotationOverLifetime.max !== undefined));
+  // ===== HIGH IMPACT PERF: free list + active list =====
+  const freeList = new Int32Array(maxP);
+  for (let i = 0; i < maxP; i++) freeList[i] = i;
 
-  const noiseActive =
-    noise &&
-    (noise.isActive === true ||
-      (noise.strength ?? 0) !== 0 ||
-      (noise.positionAmount ?? 0) !== 0 ||
-      (noise.rotationAmount ?? 0) !== 0 ||
-      (noise.sizeAmount ?? 0) !== 0);
+  const activeList = new Int32Array(maxP);
+  const activeSlot = new Int32Array(maxP);
+  activeSlot.fill(-1);
+
+  const rotOLActive = !!rotationOverLifetime?.isActive;
+  const noiseActive = !!noise?.isActive;
 
   // startValues
   (generalData.startValues as any).startSize = Array.from({ length: maxP }, () =>
@@ -587,10 +588,10 @@ export const createParticleSystem = (
   // noise data (FIX: sampler created when "active" even w/out isActive)
   (generalData.noise as any) = {
     isActive: noiseActive,
-    strength: noise?.strength ?? 0,
-    positionAmount: noise?.positionAmount ?? 0,
-    rotationAmount: noise?.rotationAmount ?? 0,
-    sizeAmount: noise?.sizeAmount ?? 0,
+    strength: noiseActive ? (noise?.strength ?? 0) : 0,
+    positionAmount: noiseActive ? (noise?.positionAmount ?? 0) : 0,
+    rotationAmount: noiseActive ? (noise?.rotationAmount ?? 0) : 0,
+    sizeAmount: noiseActive ? (noise?.sizeAmount ?? 0) : 0,
     sampler: noiseActive
       ? new FBM({
           seed: Math.random(),
@@ -674,6 +675,18 @@ export const createParticleSystem = (
 
   if (map) _batchedMaterial.uniforms.map.value = map;
 
+  // --- SPRITESHEET / TEXTURE SHEET ANIMATION ---
+  if (_batchedMaterial && textureSheetAnimation) {
+    // tiles: quante celle (cols, rows)
+    _batchedMaterial.uniforms.tiles.value.copy(textureSheetAnimation.tiles); // Vector2
+    _batchedMaterial.uniforms.fps.value = textureSheetAnimation.fps ?? 30.0;
+
+    // Se TimeMode.FPS => frameIndex avanza con elapsed * fps
+    // Se TimeMode.LIFETIME => frameIndex avanza con lifetimePercentage * totalFrames (gestito in shader)
+    _batchedMaterial.uniforms.useFPSForFrameIndex.value =
+      textureSheetAnimation.timeMode === TimeMode.FPS;
+  }
+
   const calculatedCreationTime = now + calculateValue(generalData.particleSystemId, startDelay) * 1000;
 
   const instanceData: any = {
@@ -696,14 +709,36 @@ export const createParticleSystem = (
     startIndex,
     maxParticles: maxP,
     startPositions,
+    freeList,
+    freeTop: maxP,      // stack pointer (quanti slot liberi)
+    activeList,
+    activeCount: 0,     // quanti attivi
+    activeSlot,         // particleIndex -> slot in activeList (per remove O(1))
 
     deactivateParticle: (particleIndex: number) => {
       const gi = startIndex + particleIndex;
+
+      // mark inactive (come prima)
       (_batchedPoints!.geometry.getAttribute('isActive') as THREE.BufferAttribute).array[gi] = 0;
       (_batchedPoints!.geometry.getAttribute('colorA') as THREE.BufferAttribute).array[gi] = 0;
 
       (_batchedPoints!.geometry.getAttribute('isActive') as THREE.BufferAttribute).needsUpdate = true;
       (_batchedPoints!.geometry.getAttribute('colorA') as THREE.BufferAttribute).needsUpdate = true;
+
+      // ---- NEW: ritorna nello stack degli indici liberi ----
+      instanceData.freeList[instanceData.freeTop++] = particleIndex;
+
+      // ---- NEW: rimuovi dalla active list (swap-remove O(1)) ----
+      const slot = instanceData.activeSlot[particleIndex];
+      if (slot !== -1) {
+        const lastParticleIndex = instanceData.activeList[instanceData.activeCount - 1];
+
+        instanceData.activeList[slot] = lastParticleIndex;
+        instanceData.activeSlot[lastParticleIndex] = slot;
+
+        instanceData.activeCount--;
+        instanceData.activeSlot[particleIndex] = -1;
+      }
     },
 
     activateParticle: ({
@@ -716,6 +751,24 @@ export const createParticleSystem = (
       position: Required<Point3D>;
     }) => {
       const gi = startIndex + particleIndex;
+
+      const startFrameAttr = _batchedPoints!.geometry.getAttribute('startFrame') as THREE.BufferAttribute;
+
+      // totale frame in atlas
+      const tsa = (normalizedConfig as any).textureSheetAnimation;
+      const tiles = tsa?.tiles ?? new THREE.Vector2(1, 1);
+      const totalFrames = Math.max(1, Math.floor(tiles.x * tiles.y));
+
+      // startFrame base (config) + random opzionale
+      const baseStart = Math.floor(tsa?.startFrame ?? 0);
+
+      // Variante A: tutti uguali (commenta la riga random)
+      // startFrameAttr.array[gi] = baseStart;
+
+      // Variante B: random start frame per spezzare pattern
+      startFrameAttr.array[gi] = (baseStart + Math.floor(Math.random() * totalFrames)) % totalFrames;
+
+      startFrameAttr.needsUpdate = true;
 
       const positionAttr = _batchedPoints!.geometry.getAttribute('position') as THREE.BufferAttribute;
       const isActiveAttr2 = _batchedPoints!.geometry.getAttribute('isActive') as THREE.BufferAttribute;
@@ -909,20 +962,13 @@ export const updateParticleSystems = ({ now, delta, elapsed }: CycleData) => {
         props.emissionCarry = totalToEmit - emitCount;
 
         for (let e = 0; e < emitCount; e++) {
-          let freeIndex = -1;
-          const isActiveAttr = _batchedPoints!.geometry.getAttribute('isActive') as THREE.BufferAttribute;
-          for (let i = 0; i < maxParticles; i++) {
-            const gi = startIndex + i;
-            if (isActiveAttr.array[gi] < 0.5) {
-              freeIndex = i;
-              break;
-            }
-          }
-          if (freeIndex === -1) break;
+          // O(1): prendi uno slot libero
+          if (props.freeTop <= 0) break;
+          const freeIndex = props.freeList[--props.freeTop];
 
-          // ===== FIX 2: compute shapeOffset + velocity and store them (old editor behavior) =====
-          const shapeOffset = new THREE.Vector3();
-          const spawnedVelocity = new THREE.Vector3();
+          // NO alloc per spawn
+          _shapeOffset.set(0, 0, 0);
+          _spawnedVelocity.set(0, 0, 0);
 
           // ROTATION FIX: apply baseQuat (config rotation) + emitter TRS rotation if WORLD
           const baseQuat: THREE.Quaternion | undefined = (generalData as any)._baseQuat;
@@ -932,28 +978,30 @@ export const updateParticleSystems = ({ now, delta, elapsed }: CycleData) => {
               generalData.wrapperQuaternion.copy(_tmpQuat);
               if (baseQuat) generalData.wrapperQuaternion.multiply(baseQuat);
             } else {
-              generalData.wrapperQuaternion.copy(baseQuat ?? new THREE.Quaternion());
+              // no alloc
+              generalData.wrapperQuaternion.copy(baseQuat ?? _tmpQuat.identity());
             }
           } else {
-            // LOCAL: baseQuat invertito (equivale al “cambio segno” in config)
-            const invBase = baseQuat ? baseQuat.clone().invert() : new THREE.Quaternion();
+            // LOCAL: baseQuat invertito senza clone/alloc
+            if (baseQuat) _invBaseQuat.copy(baseQuat).invert();
+            else _invBaseQuat.identity();
 
-            generalData.wrapperQuaternion.copy(invBase);
+            generalData.wrapperQuaternion.copy(_invBaseQuat);
             generalData.wrapperQuaternion.multiply(worldQuaternion); // oppure _tmpQuat
           }
 
-          // shapeOffset + spawnedVelocity (like old calculatePositionAndVelocity into startPositions + velocities)
+          // shapeOffset + spawnedVelocity
           calculatePositionAndVelocity(
             generalData,
             normalizedConfig.shape,
             normalizedConfig.startSpeed,
-            shapeOffset,
-            spawnedVelocity
+            _shapeOffset,
+            _spawnedVelocity
           );
 
           // store for this particle index
-          (props.startPositions[freeIndex] as THREE.Vector3).copy(shapeOffset);
-          velocities[freeIndex].copy(spawnedVelocity);
+          (props.startPositions[freeIndex] as THREE.Vector3).copy(_shapeOffset);
+          velocities[freeIndex].copy(_spawnedVelocity);
 
           // spawn offset only (WORLD uses emitter pos; LOCAL is 0)
           const spawnOffset =
@@ -966,6 +1014,10 @@ export const updateParticleSystems = ({ now, delta, elapsed }: CycleData) => {
             activationTime: now,
             position: spawnOffset,
           });
+
+          // NEW: aggiungi all’active list
+          props.activeSlot[freeIndex] = props.activeCount;
+          props.activeList[props.activeCount++] = freeIndex;
 
           props.lastEmissionTime = now;
         }
@@ -986,56 +1038,56 @@ export const updateParticleSystems = ({ now, delta, elapsed }: CycleData) => {
     let anyLifetimeChanged = false;
     let anyVisualChanged = false;
 
-    for (let i = 0; i < maxParticles; i++) {
+    for (let k = 0; k < props.activeCount; k++) {
+      const i = props.activeList[k];
       const gi = startIndex + i;
 
-      if (isActiveAttr.array[gi] > 0.5) {
-        const particleLifetimeMs = now - generalData.creationTimes[i];
-        const startLifetimeMs = startLifetimeAttr.array[gi];
+      const particleLifetimeMs = now - generalData.creationTimes[i];
+      const startLifetimeMs = startLifetimeAttr.array[gi];
 
-        if (particleLifetimeMs > startLifetimeMs) {
-          deactivateParticle(i);
-          continue;
-        }
-
-        const velocity = velocities[i];
-
-        velocity.x -= gravityVelocity.x * delta;
-        velocity.y -= gravityVelocity.y * delta;
-        velocity.z -= gravityVelocity.z * delta;
-
-        const positionIndex = gi * 3;
-        const positionArr = positionAttr.array as any as number[];
-
-        if (simulationSpace === SimulationSpace.WORLD) {
-          positionArr[positionIndex] -= worldPositionChange.x;
-          positionArr[positionIndex + 1] -= worldPositionChange.y;
-          positionArr[positionIndex + 2] -= worldPositionChange.z;
-        }
-
-        positionArr[positionIndex] += velocity.x * delta;
-        positionArr[positionIndex + 1] += velocity.y * delta;
-        positionArr[positionIndex + 2] += velocity.z * delta;
-
-        anyPositionChanged = true;
-
-        lifetimeAttr.array[gi] = particleLifetimeMs;
-        anyLifetimeChanged = true;
-
-        const particleLifetimePercentage = startLifetimeMs > 0 ? particleLifetimeMs / startLifetimeMs : 0;
-
-        applyModifiers({
-          delta,
-          generalData,
-          normalizedConfig,
-          attributes: _batchedPoints!.geometry.attributes as any,
-          particleLifetimePercentage,
-          particleIndex: i,
-          globalIndex: gi,
-        });
-
-        anyVisualChanged = true;
+      if (particleLifetimeMs > startLifetimeMs) {
+        deactivateParticle(i);
+        k--; // swap-remove: riprocessa lo slot k
+        continue;
       }
+
+      const velocity = velocities[i];
+
+      velocity.x -= gravityVelocity.x * delta;
+      velocity.y -= gravityVelocity.y * delta;
+      velocity.z -= gravityVelocity.z * delta;
+
+      const positionIndex = gi * 3;
+      const positionArr = positionAttr.array as any as number[];
+
+      if (simulationSpace === SimulationSpace.WORLD) {
+        positionArr[positionIndex] -= worldPositionChange.x;
+        positionArr[positionIndex + 1] -= worldPositionChange.y;
+        positionArr[positionIndex + 2] -= worldPositionChange.z;
+      }
+
+      positionArr[positionIndex] += velocity.x * delta;
+      positionArr[positionIndex + 1] += velocity.y * delta;
+      positionArr[positionIndex + 2] += velocity.z * delta;
+
+      anyPositionChanged = true;
+
+      lifetimeAttr.array[gi] = particleLifetimeMs;
+      anyLifetimeChanged = true;
+
+      const particleLifetimePercentage = startLifetimeMs > 0 ? particleLifetimeMs / startLifetimeMs : 0;
+
+      applyModifiers({
+        delta,
+        generalData,
+        normalizedConfig,
+        attributes: _batchedPoints!.geometry.attributes as any,
+        particleLifetimePercentage,
+        particleIndex: i,
+        globalIndex: gi,
+      });
+
+      anyVisualChanged = true;
     }
 
     if (anyPositionChanged) positionAttr.needsUpdate = true;
@@ -1066,6 +1118,7 @@ export const updateParticleSystems = ({ now, delta, elapsed }: CycleData) => {
 
 export const getBatchedPoints = () => _batchedPoints;
 export const getInstanceData = () => _instanceData;
+export const _debugGetEmitters = () => createdParticleSystems;
 
 export const setEmitterMatrix = (particleSystemId: number, matrix: THREE.Matrix4) => {
   if (!_batchedPoints || !_batchedMaterial) return;
