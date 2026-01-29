@@ -33,6 +33,16 @@ const ParticleSystemVertexShader = /* glsl */ `
   uniform vec4 instanceMat2[MAX_SYSTEMS];
   uniform vec4 instanceMat3[MAX_SYSTEMS];
 
+  // ---------------------------
+  // FLIPBOOK CONTROL (per system)
+  // ---------------------------
+  // 0 = LOOP, 1 = ONCE, 2 = PINGPONG, 3 = CLAMP (uguale a ONCE qui)
+  uniform float instanceFlipbookMode[MAX_SYSTEMS];
+
+  // Range di frame (inclusive). Se end < 0 => usa frames-1
+  uniform float instanceFlipbookRangeStart[MAX_SYSTEMS];
+  uniform float instanceFlipbookRangeEnd[MAX_SYSTEMS];
+
   mat4 getEmitterMatrix(int i) {
     return mat4(
       instanceMat0[i],
@@ -59,43 +69,75 @@ const ParticleSystemVertexShader = /* glsl */ `
     float rows = max(tiles.y, 1.0);
     float frames = cols * rows;
 
-    // Dimensione cella (da usare nel fragment con gl_PointCoord)
     vTileScale = vec2(1.0 / cols, 1.0 / rows);
 
-    // Frame iniziale per particella
-    float frameIndex = floor(startFrame + 0.5);
+    // system index
+    int sys = int(emitterIndex + 0.5);
+    sys = clamp(sys, 0, MAX_SYSTEMS - 1);
 
-    // Avanzamento frame
+    // range start/end (inclusive)
+    float rangeStart = floor(instanceFlipbookRangeStart[sys] + 0.5);
+    float rangeEnd = instanceFlipbookRangeEnd[sys] < 0.0
+      ? (frames - 1.0)
+      : floor(instanceFlipbookRangeEnd[sys] + 0.5);
+
+    rangeStart = clamp(rangeStart, 0.0, max(0.0, frames - 1.0));
+    rangeEnd   = clamp(rangeEnd,   0.0, max(0.0, frames - 1.0));
+
+    // se start > end, fallback: usa start come singolo frame
+    float rangeLen = max(1.0, rangeEnd - rangeStart + 1.0);
+
+    // Base frame per particella:
+    // - startFrame è un offset per-particle (può essere randomizzato lato CPU)
+    // - poi spostiamo tutto dentro al range con rangeStart
+    float baseFrame = floor(startFrame + 0.5) + rangeStart;
+
+    // Avanzamento frame (raw)
+    float adv = 0.0;
     if (frames > 1.0) {
       if (useFPSForFrameIndex) {
-        // lifetime è in ms nel tuo sistema -> converti in secondi
-        float adv = (fps <= 0.0) ? 0.0 : max((lifetime / 1000.0) * fps, 0.0);
-        frameIndex += floor(adv);
+        // lifetime è in ms -> secondi
+        adv = (fps <= 0.0) ? 0.0 : max((lifetime / 1000.0) * fps, 0.0);
       } else {
         float t = (startLifetime > 0.0) ? clamp(lifetime / startLifetime, 0.0, 1.0) : 0.0;
-        frameIndex += clamp(floor(t * frames), 0.0, frames - 1.0);
+        adv = floor(t * (rangeLen - 1.0));
       }
+    }
 
-      // wrap
-      frameIndex = mod(frameIndex, frames);
-    } else {
+    float raw = baseFrame + floor(adv);
+
+    // Applica loopMode sul range
+    float mode = instanceFlipbookMode[sys];
+    float frameIndex = raw;
+
+    if (frames <= 1.0) {
       frameIndex = 0.0;
+    } else if (mode < 0.5) {
+      // LOOP
+      frameIndex = rangeStart + mod((raw - rangeStart), rangeLen);
+    } else if (mode < 1.5) {
+      // ONCE (si ferma su end)
+      frameIndex = clamp(raw, rangeStart, rangeEnd);
+    } else if (mode < 2.5) {
+      // PINGPONG (rangeStart..rangeEnd..rangeStart..)
+      float period = max(1.0, 2.0 * rangeLen - 2.0);
+      float x = mod((raw - rangeStart), period);
+      float ping = (x <= (rangeLen - 1.0)) ? x : (period - x);
+      frameIndex = rangeStart + ping;
+    } else {
+      // CLAMP (uguale a ONCE in questa implementazione)
+      frameIndex = clamp(raw, rangeStart, rangeEnd);
     }
 
     float spriteXIndex = mod(frameIndex, cols);
     float spriteYIndex = floor(frameIndex / cols);
 
-    // Offset UV della cella selezionata.
-    // Nota: qui NON faccio flip di Y.
-    // Se vedi che le tile risultano invertite verticalmente, cambia spriteYIndex con (rows - 1.0 - spriteYIndex).
+    // Offset UV della cella selezionata (no flip Y)
     vTileOffset = vec2(spriteXIndex, spriteYIndex) * vTileScale;
 
     // ---------------------------
     // TRASFORMAZIONE EMITTER
     // ---------------------------
-    int sys = int(emitterIndex + 0.5);
-    sys = clamp(sys, 0, MAX_SYSTEMS - 1);
-
     vec3 p = position;
 
     // LOCAL => applico la matrice dell’emitter; WORLD => position è già in world

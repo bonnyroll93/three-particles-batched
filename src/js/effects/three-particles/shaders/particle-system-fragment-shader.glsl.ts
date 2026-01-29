@@ -5,9 +5,9 @@ const ParticleSystemFragmentShader = /* glsl */ `
   uniform float backgroundColorTolerance;
 
   varying vec4 vColor;
-  varying vec2 vRotSC;        // (sin, cos) dal vertex
-  varying vec2 vTileOffset;   // offset UV (0..1) della cella
-  varying vec2 vTileScale;    // scale UV (0..1) della cella: (1/cols, 1/rows)
+  varying vec2 vRotSC;         // (sin, cos) dal vertex
+  varying vec2 vTileOffset;    // offset UV (0..1) della cella
+  varying vec2 vTileScale;     // scale UV (0..1) della cella: (1/cols, 1/rows)
 
   #include <common>
   #include <logdepthbuf_pars_fragment>
@@ -26,6 +26,9 @@ const ParticleSystemFragmentShader = /* glsl */ `
 
     // UV nello sprite (0..1) dopo rotazione attorno al centro
     vec2 uvSprite = pr + center;
+
+    // FIX: flip verticale della texture dentro il quad (non tocca il range/tiles)
+    uvSprite.y = 1.0 - uvSprite.y;
 
     // Spritesheet UV: prendi la cella (offset) e scala l’uv dentro la cella
     vec2 uvAtlas = vTileOffset + uvSprite * vTileScale;

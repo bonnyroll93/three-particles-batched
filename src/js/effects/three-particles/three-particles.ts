@@ -255,40 +255,51 @@ let _createBatchedParticleRenderObject = (maxTotalParticles: number): THREE.Poin
 const initializeBatchedRenderer = () => {
   if (_batchedPoints) return;
 
-  if (_maxTotalParticles <= 0) _maxTotalParticles = 2000;
+  _maxTotalParticles = Math.max(_maxTotalParticles || 0, 2000);
 
-  _batchedMaterial = new THREE.ShaderMaterial({
-    defines: { MAX_SYSTEMS: MAX_SYSTEMS },
-    uniforms: {
-      elapsed: { value: 0.0 },
-      map: { value: createDefaultParticleTexture() },
-      tiles: { value: new THREE.Vector2(1, 1) },
-      fps: { value: 30.0 },
-      useFPSForFrameIndex: { value: false },
+  const createUniforms = () => ({
+    elapsed: { value: 0.0 },
+    map: { value: createDefaultParticleTexture() },
 
-      instanceMat0: { value: Array.from({ length: MAX_SYSTEMS }, () => new THREE.Vector4(1, 0, 0, 0)) },
-      instanceMat1: { value: Array.from({ length: MAX_SYSTEMS }, () => new THREE.Vector4(0, 1, 0, 0)) },
-      instanceMat2: { value: Array.from({ length: MAX_SYSTEMS }, () => new THREE.Vector4(0, 0, 1, 0)) },
-      instanceMat3: { value: Array.from({ length: MAX_SYSTEMS }, () => new THREE.Vector4(0, 0, 0, 1)) },
+    // Flipbook globals
+    tiles: { value: new THREE.Vector2(1, 1) },
+    fps: { value: 30.0 },
+    useFPSForFrameIndex: { value: false },
 
-      instanceStartIndex: { value: new Float32Array(MAX_SYSTEMS).fill(0) },
-      instanceParticleCount: { value: new Float32Array(MAX_SYSTEMS).fill(0) },
-      instanceMatrixCount: { value: 0 },
+    // Per-system emitter matrices (packed in vec4 rows)
+    instanceMat0: { value: Array.from({ length: MAX_SYSTEMS }, () => new THREE.Vector4(1, 0, 0, 0)) },
+    instanceMat1: { value: Array.from({ length: MAX_SYSTEMS }, () => new THREE.Vector4(0, 1, 0, 0)) },
+    instanceMat2: { value: Array.from({ length: MAX_SYSTEMS }, () => new THREE.Vector4(0, 0, 1, 0)) },
+    instanceMat3: { value: Array.from({ length: MAX_SYSTEMS }, () => new THREE.Vector4(0, 0, 0, 1)) },
 
-      instanceSimulationSpace: { value: new Float32Array(MAX_SYSTEMS).fill(0) },
-    },
-    vertexShader: ParticleSystemVertexShader,
-    fragmentShader: ParticleSystemFragmentShader,
-    transparent: true,
+    // Per-system metadata
+    instanceStartIndex: { value: new Float32Array(MAX_SYSTEMS).fill(0) },
+    instanceParticleCount: { value: new Float32Array(MAX_SYSTEMS).fill(0) },
+    instanceMatrixCount: { value: 0 },
+    instanceSimulationSpace: { value: new Float32Array(MAX_SYSTEMS).fill(0) },
 
-    // NB: verrà sovrascritto dal primo createParticleSystem() che passa renderer.blending.
-    blending: THREE.AdditiveBlending,
-
-    depthTest: true,
-    depthWrite: false,
-    vertexColors: true,
+    // Flipbook per-system (range assoluto su atlas, startFrame per-particle è relativo al range)
+    instanceFlipbookMode: { value: new Float32Array(MAX_SYSTEMS).fill(0) }, // 0=LOOP,1=ONCE,2=PINGPONG,3=CLAMP
+    instanceFlipbookRangeStart: { value: new Float32Array(MAX_SYSTEMS).fill(0) }, // inclusive
+    instanceFlipbookRangeEnd: { value: new Float32Array(MAX_SYSTEMS).fill(-1) },  // inclusive, -1 => frames-1
   });
 
+  const createMaterial = () =>
+    new THREE.ShaderMaterial({
+      defines: { MAX_SYSTEMS }, // deve matchare il nome nel tuo shader [file:1]
+      uniforms: createUniforms(),
+      vertexShader: ParticleSystemVertexShader,
+      fragmentShader: ParticleSystemFragmentShader,
+
+      transparent: true,
+      // NB: verrà sovrascritto dal primo createParticleSystem() che passa renderer.blending. [file:1]
+      blending: THREE.AdditiveBlending,
+      depthTest: true,
+      depthWrite: false,
+      vertexColors: true,
+    });
+
+  _batchedMaterial = createMaterial();
   _batchedPoints = _createBatchedParticleRenderObject(_maxTotalParticles);
   _batchedLocked = true;
 };
@@ -675,16 +686,31 @@ export const createParticleSystem = (
 
   if (map) _batchedMaterial.uniforms.map.value = map;
 
-  // --- SPRITESHEET / TEXTURE SHEET ANIMATION ---
-  if (_batchedMaterial && textureSheetAnimation) {
-    // tiles: quante celle (cols, rows)
-    _batchedMaterial.uniforms.tiles.value.copy(textureSheetAnimation.tiles); // Vector2
-    _batchedMaterial.uniforms.fps.value = textureSheetAnimation.fps ?? 30.0;
+  // --- SPRITESHEET TEXTURE SHEET ANIMATION ---
+  if (_batchedMaterial) {
+    const tsa = (textureSheetAnimation ?? {}) as any;
 
-    // Se TimeMode.FPS => frameIndex avanza con elapsed * fps
-    // Se TimeMode.LIFETIME => frameIndex avanza con lifetimePercentage * totalFrames (gestito in shader)
-    _batchedMaterial.uniforms.useFPSForFrameIndex.value =
-      textureSheetAnimation.timeMode === TimeMode.FPS;
+    // Global (restano globali come ora)
+    if (tsa.tiles) _batchedMaterial.uniforms.tiles.value.copy(tsa.tiles);
+    _batchedMaterial.uniforms.fps.value = tsa.fps ?? 30.0;
+    _batchedMaterial.uniforms.useFPSForFrameIndex.value = tsa.timeMode === TimeMode.FPS;
+
+    // Per-system loop mode + range
+    // loopMode: "loop" | "once" | "pingpong" | "clamp"  (decidi tu i nomi, qui assumo stringhe)
+    const loopMode = tsa.loopMode ?? "loop";
+    const mode =
+      loopMode === "once" ? 1 :
+      loopMode === "pingpong" ? 2 :
+      loopMode === "clamp" ? 3 :
+      0;
+
+    const range = tsa.range ?? {}; // { start?: number, end?: number }
+    const rangeStart = Math.floor(range.start ?? 0);
+    const rangeEnd = range.end == null ? -1 : Math.floor(range.end);
+
+    (_batchedMaterial.uniforms.instanceFlipbookMode.value as Float32Array)[instanceIndex] = mode;
+    (_batchedMaterial.uniforms.instanceFlipbookRangeStart.value as Float32Array)[instanceIndex] = rangeStart;
+    (_batchedMaterial.uniforms.instanceFlipbookRangeEnd.value as Float32Array)[instanceIndex] = rangeEnd;
   }
 
   const calculatedCreationTime = now + calculateValue(generalData.particleSystemId, startDelay) * 1000;
@@ -757,17 +783,28 @@ export const createParticleSystem = (
       // totale frame in atlas
       const tsa = (normalizedConfig as any).textureSheetAnimation;
       const tiles = tsa?.tiles ?? new THREE.Vector2(1, 1);
-      const totalFrames = Math.max(1, Math.floor(tiles.x * tiles.y));
+      const frames = Math.max(1, Math.floor(tiles.x * tiles.y));
 
-      // startFrame base (config) + random opzionale
+      // Range per-system (stesso significato dello shader: inclusive, end=-1 => frames-1)
+      const range = tsa?.range ?? {};
+      let rangeStart = Math.floor((range.start ?? 0));
+      let rangeEnd = (range.end == null || range.end < 0) ? (frames - 1) : Math.floor(range.end);
+
+      rangeStart = Math.max(0, Math.min(rangeStart, frames - 1));
+      rangeEnd   = Math.max(0, Math.min(rangeEnd, frames - 1));
+
+      const rangeLen = Math.max(1, rangeEnd - rangeStart + 1);
+
+      // startFrame deve essere RELATIVO al range (0..rangeLen-1)
       const baseStart = Math.floor(tsa?.startFrame ?? 0);
 
-      // Variante A: tutti uguali (commenta la riga random)
-      // startFrameAttr.array[gi] = baseStart;
+      // Opzione 1: clamp dentro rangeLen
+      const baseRel = ((baseStart % rangeLen) + rangeLen) % rangeLen;
 
-      // Variante B: random start frame per spezzare pattern
-      startFrameAttr.array[gi] = (baseStart + Math.floor(Math.random() * totalFrames)) % totalFrames;
+      // Opzione 2: random relativo (consigliata per spezzare pattern)
+      const rel = (baseRel + Math.floor(Math.random() * rangeLen)) % rangeLen;
 
+      startFrameAttr.array[gi] = rel;
       startFrameAttr.needsUpdate = true;
 
       const positionAttr = _batchedPoints!.geometry.getAttribute('position') as THREE.BufferAttribute;
