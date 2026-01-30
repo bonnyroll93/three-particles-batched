@@ -4,11 +4,14 @@ const ParticleSystemVertexShader = /* glsl */ `
   attribute float colorG;
   attribute float colorB;
   attribute float colorA;
-  attribute float lifetime;
-  attribute float startLifetime;
+  attribute float lifetime;       // age ms (lo lasciamo, ma FPS userà elapsed-birthTime)
+  attribute float startLifetime;  // ms
   attribute float rotation;
-  attribute float startFrame;
+  attribute float startFrame;     // RELATIVO al range (0..rangeLen-1) come CPU
   attribute float emitterIndex;
+
+  // NEW: tempo di nascita in ms (activationTime)
+  attribute float birthTime;
 
   varying vec4 vColor;
   varying float vLifetime;
@@ -21,8 +24,11 @@ const ParticleSystemVertexShader = /* glsl */ `
   varying vec2 vTileScale;
 
   uniform float fps;
-  uniform bool useFPSForFrameIndex;
+  uniform float instanceUseFPSForFrameIndex[MAX_SYSTEMS]; // 0=Lifetime, 1=FPS
   uniform vec2 tiles;
+
+  // NEW: tempo globale in ms (già lo aggiorni lato CPU)
+  uniform float elapsed;
 
   #include <common>
   #include <logdepthbuf_pars_vertex>
@@ -36,7 +42,7 @@ const ParticleSystemVertexShader = /* glsl */ `
   // ---------------------------
   // FLIPBOOK CONTROL (per system)
   // ---------------------------
-  // 0 = LOOP, 1 = ONCE, 2 = PINGPONG, 3 = CLAMP (uguale a ONCE qui)
+  // 0 = LOOP, 1 = ONCE, 2 = PINGPONG, 3 = CLAMP
   uniform float instanceFlipbookMode[MAX_SYSTEMS];
 
   // Range di frame (inclusive). Se end < 0 => usa frames-1
@@ -87,24 +93,33 @@ const ParticleSystemVertexShader = /* glsl */ `
     // se start > end, fallback: usa start come singolo frame
     float rangeLen = max(1.0, rangeEnd - rangeStart + 1.0);
 
-    // Base frame per particella:
-    // - startFrame è un offset per-particle (può essere randomizzato lato CPU)
-    // - poi spostiamo tutto dentro al range con rangeStart
-    float baseFrame = floor(startFrame + 0.5) + rangeStart;
+    // startFrame è RELATIVO al range: normalizziamo sempre dentro rangeLen
+    float startRel = mod(floor(startFrame + 0.5), rangeLen);
+    float baseFrame = rangeStart + startRel;
 
-    // Avanzamento frame (raw)
+    // tempo dall’attivazione (ms)
+    float ageMs = max(0.0, elapsed - birthTime);
+
+    // Avanzamento frame (raw) dentro al range
     float adv = 0.0;
-    if (frames > 1.0) {
-      if (useFPSForFrameIndex) {
-        // lifetime è in ms -> secondi
-        adv = (fps <= 0.0) ? 0.0 : max((lifetime / 1000.0) * fps, 0.0);
+
+    if (rangeLen > 1.0) {
+      if (instanceUseFPSForFrameIndex[sys] > 0.5) {
+        // FPS: usa tempo reale dalla nascita, non lifetime attr
+        float ageSec = ageMs / 1000.0;
+        adv = (fps <= 0.0) ? 0.0 : floor(ageSec * fps);
       } else {
-        float t = (startLifetime > 0.0) ? clamp(lifetime / startLifetime, 0.0, 1.0) : 0.0;
-        adv = floor(t * (rangeLen - 1.0));
+        // LIFETIME: distribuzione uniforme sulla vita
+        float t01 = (startLifetime > 0.0) ? clamp(ageMs / startLifetime, 0.0, 1.0) : 0.0;
+
+        // Nota: per LOOP/PINGPONG vogliamo periodicità; per ONCE/CLAMP vogliamo arrivare a end.
+        float mode = instanceFlipbookMode[sys];
+        float span = (mode < 0.5 || (mode >= 1.5 && mode < 2.5)) ? rangeLen : (rangeLen - 1.0);
+        adv = floor(t01 * max(1.0, span));
       }
     }
 
-    float raw = baseFrame + floor(adv);
+    float raw = baseFrame + adv;
 
     // Applica loopMode sul range
     float mode = instanceFlipbookMode[sys];

@@ -243,6 +243,9 @@ let _createBatchedParticleRenderObject = (maxTotalParticles: number): THREE.Poin
   geometry.setAttribute('instanceParticleCount', mkAttr(new Float32Array(MAX_SYSTEMS), 1));
   geometry.setAttribute('instanceSimulationSpace', mkAttr(new Float32Array(MAX_SYSTEMS), 1));
 
+  geometry.setAttribute('birthTime', mkAttr(new Float32Array(maxTotalParticles), 1));
+
+
   const points = new THREE.Points(geometry, _batchedMaterial!);
   points.frustumCulled = false;
   points.position.set(0, 0, 0);
@@ -264,7 +267,7 @@ const initializeBatchedRenderer = () => {
     // Flipbook globals
     tiles: { value: new THREE.Vector2(1, 1) },
     fps: { value: 30.0 },
-    useFPSForFrameIndex: { value: false },
+    instanceUseFPSForFrameIndex: { value: new Float32Array(MAX_SYSTEMS).fill(0) },
 
     // Per-system emitter matrices (packed in vec4 rows)
     instanceMat0: { value: Array.from({ length: MAX_SYSTEMS }, () => new THREE.Vector4(1, 0, 0, 0)) },
@@ -687,16 +690,28 @@ export const createParticleSystem = (
   if (map) _batchedMaterial.uniforms.map.value = map;
 
   // --- SPRITESHEET TEXTURE SHEET ANIMATION ---
+  // --- SPRITESHEET TEXTURE SHEET ANIMATION ---
   if (_batchedMaterial) {
     const tsa = (textureSheetAnimation ?? {}) as any;
 
-    // Global (restano globali come ora)
+    // ---- Global uniforms ----
     if (tsa.tiles) _batchedMaterial.uniforms.tiles.value.copy(tsa.tiles);
     _batchedMaterial.uniforms.fps.value = tsa.fps ?? 30.0;
-    _batchedMaterial.uniforms.useFPSForFrameIndex.value = tsa.timeMode === TimeMode.FPS;
 
-    // Per-system loop mode + range
-    // loopMode: "loop" | "once" | "pingpong" | "clamp"  (decidi tu i nomi, qui assumo stringhe)
+    // ---- Per-system: TimeMode ----
+    // Accetta: enum (TimeMode.FPS), stringhe ("FPS", "TimeMode.FPS"), numeri (1)
+    const tm = tsa.timeMode;
+    const tmStr = typeof tm === "string" ? tm : "";
+    const isFps =
+      tm === TimeMode.FPS ||
+      tm === 1 ||
+      tmStr === "FPS" ||
+      tmStr.endsWith(".FPS");
+
+    const fpsArr = _batchedMaterial.uniforms.instanceUseFPSForFrameIndex.value as Float32Array;
+    fpsArr[instanceIndex] = isFps ? 1 : 0;
+
+    // ---- Per-system: loop mode ----
     const loopMode = tsa.loopMode ?? "loop";
     const mode =
       loopMode === "once" ? 1 :
@@ -704,13 +719,20 @@ export const createParticleSystem = (
       loopMode === "clamp" ? 3 :
       0;
 
-    const range = tsa.range ?? {}; // { start?: number, end?: number }
-    const rangeStart = Math.floor(range.start ?? 0);
+    // ---- Per-system: range (inclusive). end==null => -1 (shader => frames-1) ----
+    const range = tsa.range ?? {};
+    const rangeStart = Number.isFinite(range.start) ? Math.floor(range.start) : 0;
     const rangeEnd = range.end == null ? -1 : Math.floor(range.end);
 
-    (_batchedMaterial.uniforms.instanceFlipbookMode.value as Float32Array)[instanceIndex] = mode;
-    (_batchedMaterial.uniforms.instanceFlipbookRangeStart.value as Float32Array)[instanceIndex] = rangeStart;
-    (_batchedMaterial.uniforms.instanceFlipbookRangeEnd.value as Float32Array)[instanceIndex] = rangeEnd;
+    const modeArr = _batchedMaterial.uniforms.instanceFlipbookMode.value as Float32Array;
+    const rsArr   = _batchedMaterial.uniforms.instanceFlipbookRangeStart.value as Float32Array;
+    const reArr   = _batchedMaterial.uniforms.instanceFlipbookRangeEnd.value as Float32Array;
+
+    modeArr[instanceIndex] = mode;
+    rsArr[instanceIndex] = rangeStart;
+    reArr[instanceIndex] = rangeEnd;
+
+    _batchedMaterial.uniformsNeedUpdate = true;
   }
 
   const calculatedCreationTime = now + calculateValue(generalData.particleSystemId, startDelay) * 1000;
@@ -778,6 +800,10 @@ export const createParticleSystem = (
     }) => {
       const gi = startIndex + particleIndex;
 
+      const birthTimeAttr = _batchedPoints!.geometry.getAttribute('birthTime') as THREE.BufferAttribute;
+      birthTimeAttr.array[gi] = activationTime; // ms
+      birthTimeAttr.needsUpdate = true;
+
       const startFrameAttr = _batchedPoints!.geometry.getAttribute('startFrame') as THREE.BufferAttribute;
 
       // totale frame in atlas
@@ -801,10 +827,10 @@ export const createParticleSystem = (
       // Opzione 1: clamp dentro rangeLen
       const baseRel = ((baseStart % rangeLen) + rangeLen) % rangeLen;
 
-      // Opzione 2: random relativo (consigliata per spezzare pattern)
-      const rel = (baseRel + Math.floor(Math.random() * rangeLen)) % rangeLen;
+      // // Opzione 2: random relativo (consigliata per spezzare pattern)
+      // const rel = (baseRel + Math.floor(Math.random() * rangeLen)) % rangeLen;
 
-      startFrameAttr.array[gi] = rel;
+      startFrameAttr.array[gi] = baseRel;
       startFrameAttr.needsUpdate = true;
 
       const positionAttr = _batchedPoints!.geometry.getAttribute('position') as THREE.BufferAttribute;
@@ -914,7 +940,7 @@ export const createParticleSystem = (
 export const updateParticleSystems = ({ now, delta, elapsed }: CycleData) => {
   if (!_batchedPoints || !_batchedMaterial) return;
 
-  _batchedMaterial.uniforms.elapsed.value = elapsed;
+  _batchedMaterial.uniforms.elapsed.value = now; // ms
 
   createdParticleSystems.forEach((props) => {
     const {
